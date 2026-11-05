@@ -19,7 +19,7 @@
 #include <WiFiManager.h>
 
 static ESP8266WebServer server(80);
-static const char *FIRMWARE_VERSION = "0.2.1";
+static const char *FIRMWARE_VERSION = "0.2.2";
 
 // ---- config ----
 // /config.json on SPIFFS: the same path and key names as the original
@@ -486,6 +486,228 @@ static void handleDebug()
   server.send(200, "application/json", j);
 }
 
+
+
+
+// ---- display probe (benching, not production) ----
+// Candidate pins: runtime-safe GPIOs on this board family. GPIO 0/15 are
+// boot straps, so every probe restores inputs before returning.
+static const uint8_t PROBE_PINS[8] = {0, 2, 4, 5, 12, 13, 14, 16};
+
+static void pinFloat(uint8_t p) { pinMode(p, INPUT); }
+static void pinLow(uint8_t p) { digitalWrite(p, LOW); pinMode(p, OUTPUT); }
+
+static void pinWrite(uint8_t p, bool v, bool od)
+{
+  if (od && !v)
+  {
+    digitalWrite(p, LOW);
+    pinMode(p, OUTPUT);
+    return;
+  }
+  pinMode(p, p == 16 ? INPUT : INPUT_PULLUP); // released high unless GPIO16
+  digitalWrite(p, HIGH);
+}
+
+static bool i2cReadSda(uint8_t sda) { return digitalRead(sda); }
+
+// One I2C START with given levels on the pair.
+static void i2cStartBit(uint8_t sda, uint8_t scl)
+{
+  pinWrite(sda, true, true);
+  pinWrite(scl, true, true);
+  delayMicroseconds(4);
+  pinWrite(sda, false, true);
+  delayMicroseconds(4);
+  pinWrite(scl, false, true);
+}
+
+static void i2cStopBit(uint8_t sda, uint8_t scl)
+{
+  pinWrite(sda, false, true);
+  pinWrite(scl, true, true);
+  delayMicroseconds(4);
+  pinWrite(sda, true, true);
+  delayMicroseconds(4);
+}
+
+static void i2cBit(uint8_t sda, uint8_t scl, bool bit)
+{
+  pinWrite(sda, bit, true);
+  delayMicroseconds(2);
+  pinWrite(scl, true, true);
+  delayMicroseconds(4);
+  pinWrite(scl, false, true);
+}
+
+static bool i2cTryAddress(uint8_t sda, uint8_t scl, uint8_t addr)
+{
+  i2cStartBit(sda, scl);
+  // address byte with W bit; sample the ACK after it
+  for (int i = 7; i >= 0; i--)
+    i2cBit(sda, scl, (addr >> i) & 1);
+  // release SDA, clock one bit, read ACK
+  pinWrite(sda, true, true);
+  delayMicroseconds(2);
+  pinWrite(scl, true, true);
+  delayMicroseconds(4);
+  bool ack = i2cReadSda(sda) == false; // ACK = SDA low
+  pinWrite(scl, false, true);
+  i2cStopBit(sda, scl);
+  return ack;
+}
+
+static String probeI2c()
+{
+  String out = "{\"i2c\":[";
+  bool first = true;
+  for (uint8_t s : PROBE_PINS)
+  {
+    for (uint8_t c : PROBE_PINS)
+    {
+      if (s == c)
+        continue;
+      pinFloat(s);
+      pinFloat(c);
+      for (uint8_t addr : {0x3C, 0x3D})
+      {
+        if (i2cTryAddress(s, c, addr))
+        {
+          if (!first)
+            out += ",";
+          first = false;
+          out += "{\"sda\":" + String(s) + ",\"scl\":" + String(c) +
+                 ",\"addr\":\"0x" + String(addr, 16) + "\"}";
+        }
+      }
+      pinFloat(s);
+      pinFloat(c);
+    }
+  }
+  out += "]}";
+  return out;
+}
+
+// ---- bit-banged GC9A01 fill on one candidate pin group ----
+static void bitLow(uint8_t p) { digitalWrite(p, LOW); }
+static void bitHigh(uint8_t p) { digitalWrite(p, HIGH); }
+
+// group pins are pre-set OUTPUT in fillGroup() (no pinMode in the hot loop)
+static void bbClock(uint8_t sck, uint8_t mosi, bool d)
+{
+  digitalWrite(mosi, d);
+  digitalWrite(sck, HIGH);
+  digitalWrite(sck, LOW);
+}
+
+static void bbSpiByte(uint8_t sck, uint8_t mosi, uint8_t v, bool dc, uint8_t dcpin)
+{
+  digitalWrite(dcpin, dc);
+  for (int i = 7; i >= 0; i--)
+    bbClock(sck, mosi, (v >> i) & 1);
+}
+
+static void bbCmd(uint8_t sck, uint8_t mosi, uint8_t dcpin, uint8_t cmd)
+{
+  bbSpiByte(sck, mosi, cmd, false, dcpin);
+}
+static void bbData(uint8_t sck, uint8_t mosi, uint8_t dcpin, uint8_t v)
+{
+  bbSpiByte(sck, mosi, v, true, dcpin);
+}
+
+struct PinGroup
+{
+  uint8_t sck, mosi, dc, cs;
+};
+static const PinGroup GROUPS[4] = {
+    {14, 13, 12, 16},
+    {14, 5, 4, 16},
+    {2, 0, 4, 5},
+    {14, 13, 4, 5},
+};
+
+static String fillGroup(uint8_t gi)
+{
+  const PinGroup &g = GROUPS[gi];
+  // set the four group pins as outputs once, DC/CS start low
+  pinMode(g.sck, OUTPUT); digitalWrite(g.sck, LOW);
+  pinMode(g.mosi, OUTPUT); digitalWrite(g.mosi, LOW);
+  pinMode(g.dc, OUTPUT); digitalWrite(g.dc, LOW);
+  pinMode(g.cs, OUTPUT); digitalWrite(g.cs, LOW);
+  delay(2);
+  bbCmd(g.sck, g.mosi, g.dc, 0x01); // SW reset
+  delay(50);
+  bbCmd(g.sck, g.mosi, g.dc, 0x11); // sleep out
+  delay(120);
+  bbCmd(g.sck, g.mosi, g.dc, 0x3A);
+  bbData(g.sck, g.mosi, g.dc, 0x05); // 16-bit color
+  bbCmd(g.sck, g.mosi, g.dc, 0x29);  // display on
+  bbCmd(g.sck, g.mosi, g.dc, 0x2A);  // column: 0..239
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0xEF);
+  bbCmd(g.sck, g.mosi, g.dc, 0x2B); // row: 0..239
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0x00);
+  bbData(g.sck, g.mosi, g.dc, 0xEF);
+  bbCmd(g.sck, g.mosi, g.dc, 0x2C); // RAM write
+  for (uint16_t n = 0; n < 240 * 240; n++)
+  {
+    bbData(g.sck, g.mosi, g.dc, 0xF8); // red high byte
+    bbData(g.sck, g.mosi, g.dc, 0x00);
+    if ((n & 2047) == 0)
+      delay(0); // feed the soft WDT
+  }
+  pinWrite(g.cs, true, false);
+  // restore: straps (0/15) float, others released with pullup
+  for (uint8_t p : {g.sck, g.mosi, g.dc, g.cs})
+    pinWrite(p, true, true);
+  return "{\"group\":" + String(gi) + ",\"pins\":" +
+         String(g.sck) + "/" + String(g.mosi) + "/" + String(g.dc) + "/" +
+         String(g.cs) + "}";
+}
+
+static void handleProbe()
+{
+  String what = server.arg("what");
+  String out;
+  if (what == "fill")
+  {
+    uint8_t gi = server.arg("g").toInt();
+    if (gi > 3) gi = 0;
+    server.send(200, "application/json",
+                "{\"started\":true,\"group\":" + String(gi) + ",\"pins\":\"14/13/12/16,14/5/4/16,2/0/4/5,14/13/4/5\"}");
+    const String doneNote = fillGroup(gi);
+    Serial.println("[probe] fill done " + doneNote);
+    return;
+  }
+  else
+  {
+    out = probeI2c();
+    // include group list so the fill experiment is self-describing
+    out.replace("{\"i2c\":[", "{\"groups\":[{\"i\":0,\"pins\":\"14/13/12/16\"},{\"i\":1,\"pins\":\"14/5/4/16\"},{\"i\":2,\"pins\":\"2/0/4/5\"},{\"i\":3,\"pins\":\"14/13/4/5\"}],\"i2c\":[");
+  }
+  server.send(200, "application/json", out);
+}
+
+
+
+static unsigned long lastPing = 0;
+
+void loop()
+{
+  server.handleClient();
+  if (millis() - lastPing > 30000)
+  {
+    lastPing = millis();
+    Serial.printf("[loop] t=%lu heap=%u apClients=%d\n", millis() / 1000,
+                  ESP.getFreeHeap(), WiFi.softAPgetStationNum());
+  }
+}
+
 void setup()
 {
   Serial.begin(115200);
@@ -558,19 +780,12 @@ void setup()
   server.on("/graph/2.svg", HTTP_GET, []() { serveGraph(2); });
   server.on("/health", HTTP_GET, handleHealth);
   server.on("/debug", HTTP_GET, handleDebug);
+  server.on("/probe", HTTP_GET, handleProbe);
   server.onNotFound(handleNotFound);
   server.begin();
 }
 
-static unsigned long lastPing = 0;
 
-void loop()
-{
-  server.handleClient();
-  if (millis() - lastPing > 30000)
-  {
-    lastPing = millis();
-    Serial.printf("[loop] t=%lu heap=%u apClients=%d\n", millis() / 1000,
-                  ESP.getFreeHeap(), WiFi.softAPgetStationNum());
-  }
-}
+
+
+
