@@ -1,15 +1,14 @@
-// iSpindleStation v0 — receive, store, serve.
+// iSpindleStation v0.2.0 — receive, store, serve, forward.
 //
-// Receives iSpindel POSTs (the generic-HTTP JSON payload), keeps a capped
-// JSONL history per spindle slot in SPIFFS, and serves a live page plus SVG
-// SG graphs. Forwarding and the analytics page come later; the analytics
-// run in the browser (Kotlin/JS), not in firmware.
+// On top of v0: config.json load/merge/save via the GET /get surface (the
+// vendor's field names, drop-in with their flash), a companion soft-AP so
+// paired iSpindels keep their link after the swap, and a generic-HTTP
+// forwarder that sends each received reading onward on receipt, accepting
+// host:port in server_address (the original locks the port to 80).
 //
-// Timestamps: each record gets epoch seconds from SNTP; while no time has
-// reached the box the stamp is uptime seconds and the graph label says so.
-//
+// Slots, file naming, stamping and the live/graph pages are as in v0.
 // Hardware drivers (TFT, buzzer, relay output, pressure sensor) are
-// deliberately absent in v0 — they land after the board bring-up.
+// deliberately absent; they land after board bring-up.
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -17,38 +16,143 @@
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <time.h>
-#include <WiFiManager.h> // tzapu, MIT (registry)
+#include <WiFiManager.h>
 
 static ESP8266WebServer server(80);
-static const char *FIRMWARE_VERSION = "0.1.0";
+static const char *FIRMWARE_VERSION = "0.2.1";
+
+// ---- config ----
+// /config.json on SPIFFS: the same path and key names as the original
+// relay's firmware (verified by reading its boot log), so an app image swap
+// can keep the operator's settings. Keys this firmware doesn't use are
+// preserved on every save.
+static const char *CONFIG_PATH = "/config.json";
+static struct StationConfig
+{
+  String ssid, password;
+  String apSsid, apPass;
+  int service = 255; // 255 = none; forward nothing until configured
+  String token;      // accepted, unused (the original's cloud token slot)
+  String serverAddress;
+  String uri = "/";
+  int customPeriod = 900;
+} cfg;
+
+static void defaultConfig()
+{
+  // The original's factory AP pair, so a spindle already paired to the box
+  // keeps posting while the flash swap settles. Empty server => forwarding
+  // off, which is the safe state for a fresh filesystem.
+  cfg.apSsid = "nautilus-ispindel";
+  cfg.apPass = "1234567890";
+  cfg.service = 255;
+  cfg.uri = "/";
+  cfg.customPeriod = 900;
+}
+
+static void loadConfig()
+{
+  defaultConfig();
+  DynamicJsonDocument doc(2048);
+  if (!SPIFFS.exists(CONFIG_PATH))
+    return;
+  File f = SPIFFS.open(CONFIG_PATH, "r");
+  if (!f)
+    return;
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err)
+  {
+    Serial.printf("config.json unreadable: %s\n", err.c_str());
+    return;
+  }
+  cfg.ssid = doc["ssid"] | (const char *)"";
+  cfg.password = doc["password"] | (const char *)"";
+  cfg.apSsid = doc["ap_ssid"] | cfg.apSsid;
+  cfg.apPass = doc["ap_pass"] | cfg.apPass;
+  cfg.service = doc["service"] | 255;
+  cfg.token = doc["TOKEN"] | (const char *)"";
+  cfg.serverAddress = doc["server_address"] | (const char *)"";
+  cfg.uri = doc["uri"] | (const char *)"/";
+  cfg.customPeriod = doc["custom_period"] | 900;
+  Serial.printf("config: service=%d server=%s ap=%s\n", cfg.service,
+                cfg.serverAddress.c_str(), cfg.apSsid.c_str());
+}
+
+// Merge-save: start from the existing doc, apply the present query args,
+// write the whole thing back so untouched keys survive.
+static void handleConfigSave()
+{
+  Serial.println("[get-save] enter");
+  DynamicJsonDocument doc(4096);
+  if (SPIFFS.exists(CONFIG_PATH))
+  {
+    File f = SPIFFS.open(CONFIG_PATH, "r");
+    if (f)
+    {
+      deserializeJson(doc, f); // tolerate a damaged file: it may be empty
+      f.close();
+    }
+  }
+  Serial.println("[get-save] args merged");
+  struct KV
+  {
+    const char *key;
+  };
+  const char *textKeys[] = {"ssid", "password", "ap_ssid", "ap_pass", "TOKEN",
+                            "server_address", "uri", "mqtt_user", "mqtt_pass",
+                            "uri_custom"};
+  for (const char *k : textKeys)
+    if (server.hasArg(k))
+      doc[k] = server.arg(k);
+  const char *intKeys[] = {"service", "custom_period", "i_broj", "unit_1",
+                           "unit_2", "pressure_unit", "ledState", "tft_rotate",
+                           "buzz_yesno", "temp_yesno", "temp_unit", "alarm_1",
+                           "alarm_2", "alarm_3", "alarm_4", "alarm_5", "alarm_6",
+                           "minpressure", "maxpressure"};
+  for (const char *k : intKeys)
+    if (server.hasArg(k))
+      doc[k] = server.arg(k).toInt();
+  const char *floatKeys[] = {"alarm_SG1", "alarm_SG2", "SGkorekcija1",
+                             "SGkorekcija2", "Tempkorekcija1", "Tempkorekcija2",
+                             "maxpressure_bar", "TempCorrection1"};
+  for (const char *k : floatKeys)
+    if (server.hasArg(k))
+      doc[k] = server.arg(k).toFloat();
+  if (server.hasArg("TempCorrection1"))
+    doc["TempCorrection1"] = server.arg("TempCorrection1").toFloat();
+  Serial.println("[get-save] writing config");
+  File out = SPIFFS.open(CONFIG_PATH, "w");
+  if (!out)
+  {
+    server.send(500, "text/plain", "config write failed");
+    return;
+  }
+  serializeJson(doc, out);
+  out.close();
+  Serial.println("[get-save] done");
+  loadConfig();
+  server.send(200, "text/html",
+              "<h1>Settings saved. Reboot to apply.</h1><a href='/'>home</a>");
+}
 
 // ---- storage ----
-// One JSONL file per slot. Slots follow the vendor-compatible name rule: a
-// payload name starting "1-" goes to slot 1, "2-" to slot 2, anything else
-// to slot 0 so no reading is silently dropped.
 static const char *SLOT_FILE[3] = {"/0.jsonl", "/1.jsonl", "/2.jsonl"};
-
-// Ring-cap per slot. The bench flash-id run pins the real SPIFFS budget;
-// until then this stays conservative. Graph reads never hold the file in
-// RAM (the display ring is fed at receive time), so a big file costs time,
-// not heap.
 static const uint32_t MAX_FILE_BYTES = 120000;
 
-// ---- last-known state per slot (RAM copy for the live page) ----
 static String lastName[3] = {"", "", ""};
 static float lastSg[3] = {0, 0, 0};
 static float lastTemp[3] = {0, 0, 0};
 static float lastBatt[3] = {0, 0, 0};
 static unsigned long lastSeenMillis[3] = {0, 0, 0};
 
-// ---- display ring for the SVG graph (last N SG points per slot) ----
 static const uint16_t GRAPH_POINTS = 400;
 struct GraphPoint
 {
   uint32_t ts;
   float sg;
 };
-static GraphPoint graphRing[3][GRAPH_POINTS]; // 3 * 400 * 8 B = 9.6 KB static
+static GraphPoint graphRing[3][GRAPH_POINTS]; // 3 * 400 * 8 B static
 static uint16_t graphCount[3] = {0, 0, 0};
 static uint16_t graphNext[3] = {0, 0, 0};
 
@@ -74,10 +178,9 @@ static int slotForName(const String &name)
   return 0;
 }
 
-// Append one line; when the file passes the cap, stream its newest half
-// into a temp file and swap, never holding the file in RAM.
 static bool appendJsonl(const char *path, const String &line)
 {
+  Serial.printf("[append] %s\n", path);
   File out = SPIFFS.open(path, "a");
   if (!out)
     return false;
@@ -92,7 +195,7 @@ static bool appendJsonl(const char *path, const String &line)
   if (!src)
     return false;
   src.seek(size / 2, SeekSet);
-  while (src.available() && src.read() != '\n') // snap to a line start
+  while (src.available() && src.read() != '\n')
   {
   }
   String tmpPath = String(path) + ".tmp";
@@ -111,36 +214,73 @@ static bool appendJsonl(const char *path, const String &line)
   return SPIFFS.remove(path) && SPIFFS.rename(tmpPath, path);
 }
 
-static void recordSlot(int slot, const String &name, float sg, float temp,
-                       float batt, DynamicJsonDocument &doc, const String &body)
+// ---- forwarder ----
+// Generic HTTP (service 10): one connect per received reading, sent on
+// receipt like the original. server_address may carry host:port.
+static void forwardOnReceipt(const String &body)
+{
+  if (cfg.service != 10 || cfg.serverAddress.isEmpty())
+    return;
+  String host = cfg.serverAddress;
+  int port = 80;
+  int colon = host.lastIndexOf(':');
+  bool hasPort = false;
+  if (colon > 0)
+  {
+    String p = host.substring(colon + 1);
+    if (p.toInt() > 0)
+    {
+      port = p.toInt();
+      host = host.substring(0, colon);
+      hasPort = true;
+    }
+  }
+  if (host.isEmpty())
+    return;
+  WiFiClient c;
+  String path = cfg.uri.isEmpty() ? String("/") : cfg.uri;
+  bool ok = c.connect(host.c_str(), port); // 5 s default timeout inside connect
+  if (!ok)
+  {
+    Serial.printf("forward connect failed %s:%d%s\n", host.c_str(), port,
+                  hasPort ? "" : " (host only)");
+    return;
+  }
+  String req = "POST " + path + " HTTP/1.1\r\nHost: " + host + "\r\n" +
+               "Content-Type: application/json\r\n" +
+               "Content-Length: " + String(body.length()) + "\r\n" +
+               "Connection: close\r\n\r\n" + body;
+  c.print(req);
+  uint32_t deadline = millis() + 1000;
+  while (c.connected() && millis() < deadline)
+    delay(10);
+  c.stop();
+  Serial.printf("forwarded %u bytes to %s:%d%s\n", body.length(), host.c_str(),
+                port, path.c_str());
+}
+
+static bool recordSlot(int slot, const String &name, float sg, float temp,
+                       float batt, const String &body)
 {
   String line = "{\"ts\":" + String(epochNow()) + ",\"payload\":" + body + "}";
   if (!appendJsonl(SLOT_FILE[slot], line))
   {
     server.send(500, "application/json", "{\"error\":\"write failed\"}");
     Serial.printf("append failed for %s\n", SLOT_FILE[slot]);
-    return;
+    return false;
   }
   lastName[slot] = name;
   lastSg[slot] = sg;
   lastTemp[slot] = temp;
   lastBatt[slot] = batt;
   lastSeenMillis[slot] = millis();
-
-  if (doc["gravity"].is<float>())
-  {
-    GraphPoint &p = graphRing[slot][graphNext[slot]];
-    p.ts = epochNow();
-    p.sg = doc["gravity"];
-    graphNext[slot] = (graphNext[slot] + 1) % GRAPH_POINTS;
-    if (graphCount[slot] < GRAPH_POINTS)
-      graphCount[slot]++;
-  }
   server.send(200, "application/json", "{\"status\":\"ok\"}");
+  return true;
 }
 
 static void handleReceive()
 {
+  Serial.println("[receive] enter");
   String body = server.arg("plain");
   if (body.length() == 0 || body.length() > 2048)
   {
@@ -155,11 +295,24 @@ static void handleReceive()
     Serial.printf("rejecting post (%u bytes): %s\n", body.length(), err.c_str());
     return;
   }
+  int slot = slotForName(doc["name"] | String("unknown"));
   String name = doc["name"] | String("unknown");
   float sg = doc["gravity"] | 0.0f;
   float temp = doc["temperature"] | 0.0f;
   float batt = doc["battery"] | 0.0f;
-  recordSlot(slotForName(name), name, sg, temp, batt, doc, body);
+  if (!recordSlot(slot, name, sg, temp, batt, body))
+    return; // disk refused the reading; do not forward what we failed to keep
+
+  if (doc["gravity"].is<float>())
+  {
+    GraphPoint &p = graphRing[slot][graphNext[slot]];
+    p.ts = epochNow();
+    p.sg = sg;
+    graphNext[slot] = (graphNext[slot] + 1) % GRAPH_POINTS;
+    if (graphCount[slot] < GRAPH_POINTS)
+      graphCount[slot]++;
+  }
+  forwardOnReceipt(body); // after the reading is stored and answered
 }
 
 static void serveSlot(int s)
@@ -183,8 +336,6 @@ static void serveGraph(int slot)
     server.send(200, "image/svg+xml", "<svg xmlns='http://www.w3.org/2000/svg'/>");
     return;
   }
-  // Ring order: when full, graphNext points at the oldest entry; while
-  // filling, slot 0 holds the first reading.
   uint16_t start = (n == GRAPH_POINTS) ? graphNext[slot] : 0;
   float lo = INFINITY, hi = -INFINITY;
   for (uint16_t i = 0; i < n; i++)
@@ -201,7 +352,7 @@ static void serveGraph(int slot)
   const int W = 700, H = 300, M = 40;
   String pts;
   if (!pts.reserve(n * 14))
-  { // ~14 chars per point; skip the build if RAM is short
+  {
     server.send(503, "text/plain", "not enough memory for graph");
     return;
   }
@@ -225,13 +376,9 @@ static void serveGraph(int slot)
   svg += "<text x='" + String(M) + "' y='" + String(H - 10) +
          "' fill='#9fb8a5' font-size='12'>";
   if (sntpActive())
-    svg += "SG " + String(lo + pad, 3) + "–" + String(hi - pad, 3);
-  svg += "</text>";
-  svg += "<text x='" + String(W - 110) + "' y='20' fill='#9fb8a5' font-size='12'>";
-  if (sntpActive())
-    svg += "span " + String((uint32_t)(newest.ts - oldest.ts)) + " s";
-  svg += "</text>";
-  svg += "</svg>";
+    svg += "SG " + String(lo + pad, 3) + "-" + String(hi - pad, 3) +
+           ", span " + String((uint32_t)(newest.ts - oldest.ts)) + " s";
+  svg += "</text></svg>";
   server.send(200, "image/svg+xml", svg);
 }
 
@@ -252,26 +399,40 @@ static void handleLive()
       continue;
     }
     long ago = (long)((millis() - lastSeenMillis[s]) / 1000);
-    page += "<p><b>Slot " + String(s) + "</b> (" + lastName[s] + ") — seen " +
+    page += "<p><b>Slot " + String(s) + "</b> (" + lastName[s] + ") - seen " +
             String(ago) + " s ago</p>";
     page += "<p>SG: " + String(lastSg[s], 4) +
-            " · Temp: " + String(lastTemp[s], 2) + " °C" +
-            " · Battery: " + String(lastBatt[s], 2) + " V</p>";
+            " - Temp: " + String(lastTemp[s], 2) + " C" +
+            " - Battery: " + String(lastBatt[s], 2) + " V</p>";
     if (s != 0)
-      page += "<p><a href='/graph/" + String(s) + ".svg'>Graph</a> · " +
+      page += "<p><a href='/graph/" + String(s) + ".svg'>Graph</a> - " +
               "<a href='/data/" + String(s) + ".jsonl'>Data</a></p>";
   }
   page += "<hr><p style='font-size:.8em'>iSpindleStation v" + String(FIRMWARE_VERSION) +
-          " · " + WiFi.localIP().toString() + "</p></body></html>";
+          " - " + WiFi.localIP().toString() + " - ap " + WiFi.softAPIP().toString() +
+          "</p></body></html>";
   server.send(200, "text/html", page);
 }
 
 static void handleHealth()
 {
-  String j = "{\"name\":\"iSpindleStation\",\"firmware\":\"" + String(FIRMWARE_VERSION) +
-             "\",\"epoch\":" + String(epochNow()) + ",\"sntp\":" +
-             String(sntpActive() ? "true" : "false") + "}";
+  DynamicJsonDocument doc(512);
+  doc["name"] = "iSpindleStation";
+  doc["firmware"] = FIRMWARE_VERSION;
+  doc["epoch"] = epochNow();
+  doc["sntp"] = sntpActive();
+  doc["ap"] = WiFi.softAPIP().toString();
+  doc["sta"] = WiFi.localIP().toString();
+  String j;
+  serializeJson(doc, j);
   server.send(200, "application/json", j);
+}
+
+static void handleReboot()
+{
+  server.send(200, "text/plain", "rebooting");
+  delay(500);
+  ESP.restart();
 }
 
 static void handleNotFound()
@@ -286,29 +447,109 @@ static void handleNotFound()
   server.send(404, "text/plain", "not found");
 }
 
+static void handleDebug()
+{
+  fs::FSInfo64 fsinfo;
+  SPIFFS.info64(fsinfo);
+  String j = "{\"firmware\":\"" + String(FIRMWARE_VERSION) +
+             "\",\"fsTotal\":" + String((uint32_t)fsinfo.totalBytes) +
+             ",\"fsUsed\":" + String((uint32_t)fsinfo.usedBytes) +
+             ",\"fsMounted\":" + (SPIFFS.begin() ? "true" : "false") +
+             ",\"sta\":\"" + WiFi.localIP().toString() +
+             "\",\"apClients\":" + String(WiFi.softAPgetStationNum()) +
+             ",\"heap\":" + String(ESP.getFreeHeap()) +
+             ",\"files\":[";
+  Dir rd = SPIFFS.openDir("/");
+  bool first = true;
+  while (rd.next())
+  {
+    if (!first)
+      j += ",";
+    first = false;
+    j += "{\"name\":\"" + rd.fileName() + "\",\"size\":" +
+         String((unsigned)rd.fileSize()) + "}";
+  }
+  j += "]";
+  if (SPIFFS.exists(CONFIG_PATH))
+  {
+    File f = SPIFFS.open(CONFIG_PATH, "r");
+    if (f)
+    {
+      String cfgText = f.readString(); // config is < 1 KB; heap can hold it
+      f.close();
+      if (cfgText.length() > 600)
+        cfgText = cfgText.substring(0, 600);
+      j += ",\"configText\":" + cfgText;
+    }
+  }
+  j += "}";
+  server.send(200, "application/json", j);
+}
+
 void setup()
 {
   Serial.begin(115200);
+  delay(100);
+  Serial.println("\niSpindleStation boot");
   if (!SPIFFS.begin())
-    Serial.println("SPIFFS mount failed");
+  {
+    Serial.println("SPIFFS mount FAILED - formatting");
+    delay(100);
+    SPIFFS.format();
+    if (!SPIFFS.begin())
+      Serial.println("SPIFFS mount failed after format");
+  }
+  {
+    Dir rd = SPIFFS.openDir("/");
+    Serial.println("FS contents:");
+    while (rd.next())
+      Serial.printf("  %-24s %u B\n", rd.fileName().c_str(), (unsigned)rd.fileSize());
+  }
 
+  loadConfig();
   WiFi.hostname("iSpindleStation");
-  WiFiManager wm;
-  wm.setConfigPortalTimeout(300); // bounded like the original's portal
-  wm.setBreakAfterConfig(true);
-  if (!wm.autoConnect("iSpindleStation"))
-  { // falls back to the AP portal on failure
-    Serial.println("no connection after portal, restarting");
-    delay(2000);
-    ESP.restart();
+
+  bool joined = false;
+  if (cfg.ssid.length() > 0)
+  {
+    WiFi.begin(cfg.ssid.c_str(), cfg.password.c_str());
+    for (int i = 0; i < 25 && !joined; i++)
+    {
+      delay(1000);
+      joined = WiFi.status() == WL_CONNECTED;
+    }
+  }
+  if (!joined)
+  { // fall back to the AP portal, bounded like the original's
+    WiFiManager wm;
+    wm.setConfigPortalTimeout(300);
+    wm.setBreakAfterConfig(true);
+    if (!wm.autoConnect("iSpindleStation"))
+    {
+      Serial.println("no connection after portal, restarting");
+      delay(2000);
+      ESP.restart();
+    }
   }
   Serial.printf("joined %s as %s\n", WiFi.SSID().c_str(), WiFi.localIP().toString().c_str());
 
-  // SNTP for record timestamps; harmless when the net has no uplink.
+  // Companion AP for spindles already paired to the box; the radio shares
+  // the STA's channel, so the AP follows whatever the join landed on.
+  if (!cfg.apSsid.isEmpty())
+  {
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                      IPAddress(255, 255, 255, 0));
+    WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str());
+    Serial.printf("soft AP %s at %s\n", cfg.apSsid.c_str(),
+                  WiFi.softAPIP().toString().c_str());
+  }
+
   configTime(0, 0, "pool.ntp.org");
 
   server.on("/", HTTP_GET, handleLive);
   server.on("/gravity", HTTP_POST, handleReceive);
+  server.on("/get", HTTP_GET, handleConfigSave);
+  server.on("/reboot", HTTP_ANY, handleReboot);
   server.on("/data/0.jsonl", HTTP_GET, []() { serveSlot(0); });
   server.on("/data/1.jsonl", HTTP_GET, []() { serveSlot(1); });
   server.on("/data/2.jsonl", HTTP_GET, []() { serveSlot(2); });
@@ -316,11 +557,20 @@ void setup()
   server.on("/graph/1.svg", HTTP_GET, []() { serveGraph(1); });
   server.on("/graph/2.svg", HTTP_GET, []() { serveGraph(2); });
   server.on("/health", HTTP_GET, handleHealth);
+  server.on("/debug", HTTP_GET, handleDebug);
   server.onNotFound(handleNotFound);
   server.begin();
 }
 
+static unsigned long lastPing = 0;
+
 void loop()
 {
   server.handleClient();
+  if (millis() - lastPing > 30000)
+  {
+    lastPing = millis();
+    Serial.printf("[loop] t=%lu heap=%u apClients=%d\n", millis() / 1000,
+                  ESP.getFreeHeap(), WiFi.softAPgetStationNum());
+  }
 }
