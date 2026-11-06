@@ -18,6 +18,10 @@
 #include <time.h>
 #include <WiFiManager.h>
 
+// forward declarations for display functions used in loop()
+static void drawDisplay();
+static void fillScreen(uint16_t colour);
+
 static ESP8266WebServer server(80);
 static const char *FIRMWARE_VERSION = "0.2.2";
 
@@ -259,6 +263,17 @@ static void forwardOnReceipt(const String &body)
                 port, path.c_str());
 }
 
+// display data struct (populated by recordSlot, read by drawDisplay)
+struct SpindelDisplay {
+    bool active;
+    char name[9];
+    float gravity, temp, battery;
+    float intervalSec, ageSec;
+};
+static SpindelDisplay display_slot[2] = {};
+static unsigned long last_seen_ms[3] = {0, 0, 0};
+
+
 static bool recordSlot(int slot, const String &name, float sg, float temp,
                        float batt, const String &body)
 {
@@ -274,6 +289,19 @@ static bool recordSlot(int slot, const String &name, float sg, float temp,
   lastTemp[slot] = temp;
   lastBatt[slot] = batt;
   lastSeenMillis[slot] = millis();
+  
+  // feed the display data
+  if (slot < 2) {
+    display_slot[slot].active = true;
+    strncpy(display_slot[slot].name, name.c_str(), 8);
+    display_slot[slot].name[8] = 0;
+    display_slot[slot].gravity = sg;
+    display_slot[slot].temp = temp;
+    display_slot[slot].battery = batt;
+    display_slot[slot].intervalSec = 900.0f;
+    // approximate age (millis since last read)
+    display_slot[slot].ageSec = 0; // filled by loop redraw
+  }
   server.send(200, "application/json", "{\"status\":\"ok\"}");
   return true;
 }
@@ -705,7 +733,341 @@ void loop()
     lastPing = millis();
     Serial.printf("[loop] t=%lu heap=%u apClients=%d\n", millis() / 1000,
                   ESP.getFreeHeap(), WiFi.softAPgetStationNum());
+    drawDisplay(); // redraw from current slot data
   }
+}
+
+
+// ---- configurable SPI display probe ----
+// /spi_probe?sck=N&mosi=N&dc=N&cs=N&mode=init|fill
+struct SPIPinSet { uint8_t sck, mosi, dc, cs; };
+
+static void handleSpiProbe() {
+    int8_t sck = server.arg("sck").toInt();
+    int8_t mosi = server.arg("mosi").toInt();
+    int8_t dc = server.arg("dc").toInt();
+    int8_t cs = server.arg("cs").toInt();
+    int8_t rst = server.arg("rst").toInt();
+    if (sck < 0 || mosi < 0 || dc < 0 || cs < 0) {
+        server.send(400, "application/json", "{\"error\":\"need sck&mosi&dc&cs\"}");
+        return;
+    }
+    bool has_rst = (rst >= 0 && rst <= 16 && rst != sck && rst != mosi && rst != dc && rst != cs);
+    String mode = server.arg("mode");
+    if (mode.length() == 0) mode = "fill";
+    String spd = server.arg("spd");
+    int bit_delay = (spd == "slow") ? 5 : 1;  // µs per clock edge
+
+    // set outputs
+    pinMode(sck, OUTPUT); digitalWrite(sck, LOW);
+    pinMode(mosi, OUTPUT); digitalWrite(mosi, LOW);
+    pinMode(dc, OUTPUT); digitalWrite(dc, LOW);
+    pinMode(cs, OUTPUT); digitalWrite(cs, HIGH);
+    if (has_rst) { pinMode(rst, OUTPUT); digitalWrite(rst, HIGH); }
+    delayMicroseconds(10);
+
+    if (has_rst) {
+        // GC9A01 hardware reset: RST LOW ≥ 20 µs, then wait 120 ms
+        digitalWrite(rst, LOW); delayMicroseconds(50);
+        digitalWrite(rst, HIGH); delay(120);
+    }
+
+    digitalWrite(cs, LOW); delayMicroseconds(10);
+
+    // helper lambdas for SPI write with configurable delay
+    auto wr = [&](uint8_t v, bool data) {
+        digitalWrite(dc, data ? HIGH : LOW);
+        for (int8_t i = 7; i >= 0; i--) {
+            digitalWrite(mosi, (v >> i) & 1);
+            delayMicroseconds(bit_delay);
+            digitalWrite(sck, HIGH);
+            delayMicroseconds(bit_delay);
+            digitalWrite(sck, LOW);
+        }
+    };
+
+    // GC9A01 init sequence
+    wr(0x01, false); delay(120);       // SWRESET
+    wr(0x11, false); delay(50);        // SLPOUT
+    wr(0x3A, false); wr(0x05, true);   // COLMOD 16-bit
+    wr(0x29, false); delay(10);        // DISPON
+
+    if (mode == "fill" || mode == "init") {
+        wr(0x2A, false); wr(0x00, true); wr(0x00, true); wr(0x00, true); wr(0xEF, true);
+        wr(0x2B, false); wr(0x00, true); wr(0x00, true); wr(0x00, true); wr(0xEF, true);
+        wr(0x2C, false);               // RAMWR
+        for (uint16_t n = 0; n < 240 * 240; n++) {
+            for (int8_t i = 7; i >= 0; i--) { digitalWrite(mosi, (0xF8 >> i) & 1); digitalWrite(sck, HIGH); delayMicroseconds(bit_delay); digitalWrite(sck, LOW); }
+            for (int8_t i = 7; i >= 0; i--) { digitalWrite(mosi, 0); digitalWrite(sck, HIGH); delayMicroseconds(bit_delay); digitalWrite(sck, LOW); }
+            if ((n & 2047) == 0) delay(0);
+        }
+    }
+
+    digitalWrite(cs, HIGH);
+    for (uint8_t p : {sck, mosi, dc, cs}) { pinMode(p, p == 16 ? INPUT : INPUT_PULLUP); }
+    if (has_rst) { pinMode(rst, rst == 16 ? INPUT : INPUT_PULLUP); }
+
+    String r = "{\"done\":true,\"sck\":" + String(sck) + ",\"mosi\":" + String(mosi) + ",\"dc\":" + String(dc) + ",\"cs\":" + String(cs) + ",\"rst\":" + String(has_rst ? rst : -1) + ",\"mode\":\"" + mode + "\",\"spd\":\"" + spd + "\"}";
+    server.send(200, "application/json", r);
+}
+
+
+// ---- GC9A01 display driver (hardware SPI1 on HSPI pins) ----
+#include <SPI.h>
+
+#define TFT_SCK_PIN   14
+#define TFT_MISO_PIN  12
+#define TFT_MOSI_PIN  13
+#define TFT_CS_PIN    0
+#define TFT_DC_PIN    4
+#define TFT_RST_PIN   5
+#define TFT_BL_PIN    15
+
+SPIClass tftSPI;
+
+static uint16_t lastSG1 = 0; // cached for dirty-draw
+static float lastGravity1 = 0.0f;
+static float lastTemp1 = 0.0f;
+static float lastBatt1 = 0.0f;
+static bool displayDrawn = false;
+
+// RGB565 palette
+#define COL_BG       0x0000
+#define COL_DIVIDER  0x31A7
+#define COL_SG       0xFFDF
+#define COL_TEMP     0x3EDF
+#define COL_NAME     0xB5D8
+#define COL_OK       0x270C
+#define COL_WARN     0xFDC0
+#define COL_ALERT    0xF986
+#define COL_EMPTY    0x52CC
+
+// display struct: the two spindle slots
+
+static SpindelDisplay slot[2];
+
+static void tftWrite(uint8_t data) {
+    tftSPI.write(data);
+}
+
+static void tftCommand(uint8_t cmd) {
+    digitalWrite(TFT_DC_PIN, LOW);
+    digitalWrite(0, LOW); // CS low
+    tftSPI.write(cmd);
+    digitalWrite(0, HIGH); // CS high
+}
+
+static void tftData(uint8_t data) {
+    digitalWrite(TFT_DC_PIN, HIGH);
+    digitalWrite(0, LOW);
+    tftSPI.write(data);
+    digitalWrite(0, HIGH);
+}
+
+static void tftBegin() {
+    // configure SPI on hardware HSPI pins 14/13
+    tftSPI.setFrequency(20000000);
+    tftSPI.setFrequency(20000000);
+    
+    pinMode(TFT_CS_PIN, OUTPUT);  digitalWrite(TFT_CS_PIN, HIGH);
+    pinMode(TFT_DC_PIN, OUTPUT);  digitalWrite(TFT_DC_PIN, HIGH);
+    
+    // RST sequence: HIGH 5ms → LOW 20ms → HIGH 150ms
+    pinMode(TFT_RST_PIN, OUTPUT); digitalWrite(TFT_RST_PIN, HIGH); delay(5);
+    digitalWrite(TFT_RST_PIN, LOW);  delay(20);
+    digitalWrite(TFT_RST_PIN, HIGH); delay(150);
+    
+    // GC9A01 init sequence
+    tftCommand(0xEF);           // unlock (some variants)
+    tftData(0xEB); tftData(0x02); tftData(0xE8); // 0xEB,0x02 sequence
+    tftData(0x00); tftData(0x00); // ... 0xE8 args truncated
+    
+    tftCommand(0x01);           // SWRESET
+    delay(120);
+    tftCommand(0x11);           // SLPOUT
+    delay(50);
+    tftCommand(0x3A);           // COLMOD
+    tftData(0x05);              // 16-bit colour
+    delay(10);
+    tftCommand(0x29);           // DISPON
+    delay(20);
+}
+
+static void tftSetWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
+    tftCommand(0x2A);          // CASET
+    tftData(x0 >> 8); tftData(x0 & 0xFF);
+    tftData(x1 >> 8); tftData(x1 & 0xFF);
+    tftCommand(0x2B);          // RASET
+    tftData(y0 >> 8); tftData(y0 & 0xFF);
+    tftData(y1 >> 8); tftData(y1 & 0xFF);
+    tftCommand(0x2C);          // RAMWR
+    digitalWrite(TFT_DC_PIN, HIGH);
+    digitalWrite(TFT_CS_PIN, LOW);
+}
+
+// draw a single character in a 5x7 pixel font (7-pixel cell, 6x8 advance)
+// only glyphs 0x2E(..), 0x2D(-), 0x30-0x39(digits), 0x41(a-f hex), 0xBE(°)
+static const uint8_t FONT5x7[][6] = {
+    // [0]=0x00   space
+    {0x00,0x00,0x00,0x00,0x00,0x00},
+    // [1]=0x2D   hyphen
+    {0x00,0x00,0x00,0x7E,0x00,0x00},
+    // [2]=0x2E   dot
+    {0x00,0x60,0x60,0x60,0x00,0x00},
+    // [3]=0x30   0
+    {0x3E,0x61,0x51,0x49,0x45,0x3E},
+    // [4]=0x31   1
+    {0x00,0x42,0x7F,0x40,0x00,0x00},
+    // [5]=0x32   2
+    {0x62,0x51,0x49,0x49,0x46,0x30},
+    // [6]=0x33   3
+    {0x22,0x41,0x49,0x49,0x36,0x00},
+    // [7]=0x34   4
+    {0x18,0x14,0x12,0x7F,0x10,0x00},
+    // [8]=0x35   5
+    {0x27,0x45,0x45,0x45,0x39,0x00},
+    // [9]=0x36   6
+    {0x3E,0x49,0x49,0x49,0x32,0x00},
+    // [10]=0x37  7
+    {0x03,0x01,0x71,0x0D,0x07,0x00},
+    // [11]=0x38  8
+    {0x36,0x49,0x49,0x49,0x36,0x00},
+    // [12]=0x39  9
+    {0x26,0x49,0x49,0x49,0x3E,0x00},
+    // [13]=0x41  A
+    {0x7E,0x11,0x11,0x11,0x7E,0x00},
+    // [14]=0x42  B
+    {0x7F,0x49,0x49,0x49,0x36,0x00},
+    // [15]=0x43  C
+    {0x3E,0x41,0x41,0x41,0x22,0x00},
+    // [16]=0x44  D
+    {0x7F,0x41,0x41,0x22,0x1C,0x00},
+    // [17]=0x45  E
+    {0x7F,0x49,0x49,0x49,0x41,0x41},
+    // [18]=0x46  F
+    {0x7F,0x09,0x09,0x09,0x01,0x01},
+};
+
+static const uint8_t *glyphFor(char c) {
+    // map char to our font table
+    switch(c) {
+    case ' ': return FONT5x7[0];
+    case '-': return FONT5x7[1];
+    case '.': return FONT5x7[2];
+    default:
+        if (c>= '0' && c<= '9') return FONT5x7[3+(c-'0')];
+        if (c>= 'A' && c<= 'F') return FONT5x7[13+(c-'A')];
+        if (c>= 'a' && c<= 'f') return FONT5x7[13+(c-'a')];
+        // ° = 0xBE, degree sign
+        if (c == 0xB0) {
+            // degree is just a small square with a gap
+            static uint8_t deg[6] = {0x0E,0x11,0x11,0x11,0x0E,0x00};
+            return deg;
+        }
+        return nullptr;
+    }
+}
+
+// draw text at (x,y) in the 5x7 font, colour, transparent bg
+static void drawGlyph(const uint8_t *glyph, uint16_t x, uint16_t y, uint16_t colour) {
+    for (uint8_t col = 0; col < 5; col++) {
+        uint8_t row = glyph[col];
+        for (uint8_t bi = 0; bi < 8; bi++) {
+            if (row & (1 << bi)) {
+                // pixel at (x+col, y+bi)
+                // batch into a window write per column for efficiency
+                tftSetWindow(x + col, y + bi, x + col, y + bi);
+                tftSPI.write16(colour);
+            }
+        }
+    }
+}
+
+static void drawText(const char *text, uint16_t x, uint16_t y, uint16_t colour, uint8_t scale) {
+    uint16_t cx = x;
+    // for scale > 1, each font pixel = scale x scale block
+    while (*text) {
+        const uint8_t *g = glyphFor(*text);
+        if (g) {
+            for (uint8_t col = 0; col < 5; col++) {
+                uint8_t row = g[col];
+                for (uint8_t bi = 0; bi < 7; bi++) {
+                    if (row & (1 << bi)) {
+                        // draw a scale x scale block
+                        for (uint8_t sy = 0; sy < scale; sy++) {
+                            for (uint8_t sx = 0; sx < scale; sx++) {
+                                // fill pixel at (cx + col*scale + sx, y + bi*scale + sy)
+                                tftSetWindow(cx + col*scale + sx, y + bi*scale + sy,
+                                             cx + col*scale + sx, y + bi*scale + sy);
+                                tftSPI.write16(colour);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += 6 * scale;
+        text++;
+    }
+}
+
+// fill the full display with one colour
+static void fillScreen(uint16_t colour) {
+    tftSetWindow(0, 0, 239, 239);
+    for (uint16_t n = 0; n < 240*240; n++) {
+        tftSPI.write16(colour);
+        if ((n & 2047) == 0) delay(0);
+    }
+    digitalWrite(TFT_CS_PIN, HIGH);
+}
+
+// draw the full display layout (two hemispheres)
+static void drawDisplay() {
+    fillScreen(COL_BG);
+    
+    // divider
+    digitalWrite(TFT_DC_PIN, HIGH);
+    digitalWrite(TFT_CS_PIN, LOW);
+    for (uint16_t px = 18; px <= 221; px++) {
+        tftSetWindow(px, 120, px, 121);
+        tftSPI.write16(COL_DIVIDER); tftSPI.write16(COL_DIVIDER);
+    }
+    digitalWrite(TFT_CS_PIN, HIGH);
+    
+    for (int slotIdx = 0; slotIdx < 2; slotIdx++) {
+        bool isTop = (slotIdx == 0);
+        uint16_t ySG   = isTop ? 52  : 146;
+        uint16_t yTemp = isTop ? 44  : 138;
+        uint16_t yBatt = isTop ? 72  : 164;
+        uint16_t yName = isTop ? 14  : 210;
+        
+        if (!display_slot[slotIdx].active) {
+            uint16_t ySG2 = isTop ? 52 : 146;
+            drawText("-.---", 60, ySG2, COL_EMPTY, 4);
+            drawText(isTop ? "SLOT 1" : "SLOT 2", 60, isTop ? 14 : 210, COL_EMPTY, 2);
+            continue;
+        }
+        
+        // SG hero: 4 char = 4 digit * 6 px = 24 px font cell, scale = 5
+        char sgBuf[8];
+        snprintf(sgBuf, sizeof(sgBuf), "1.%.3f", slot[slotIdx].gravity);
+        drawText(sgBuf, 36, ySG, COL_SG, 5);
+        
+        // temp: 3 chars + degree
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%.1f'", slot[slotIdx].temp);
+        drawText(buf, 130, yTemp, COL_TEMP, 3);
+        
+        // battery
+        float bv = display_slot[slotIdx].battery;
+        uint16_t bcol = (bv >= 3.70f) ? COL_OK : (bv >= 3.45f ? COL_WARN : COL_ALERT);
+        snprintf(buf, sizeof(buf), "%.2fV", bv);
+        digitalWrite(TFT_DC_PIN, HIGH); digitalWrite(TFT_CS_PIN, LOW);
+        drawText(buf, 148, yBatt, bcol, 3);
+        digitalWrite(TFT_CS_PIN, HIGH);
+    }
+    displayDrawn = true;
+    digitalWrite(TFT_CS_PIN, HIGH);
 }
 
 void setup()
@@ -781,8 +1143,15 @@ void setup()
   server.on("/health", HTTP_GET, handleHealth);
   server.on("/debug", HTTP_GET, handleDebug);
   server.on("/probe", HTTP_GET, handleProbe);
+  server.on("/spi_probe", HTTP_GET, handleSpiProbe);
   server.onNotFound(handleNotFound);
   server.begin();
+
+  // backlight on before drawing
+  pinMode(TFT_BL_PIN, OUTPUT); digitalWrite(TFT_BL_PIN, HIGH);
+  tftBegin();
+  delay(100);
+  fillScreen(COL_BG);
 }
 
 
