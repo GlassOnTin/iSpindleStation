@@ -2,6 +2,7 @@
 
 Open-source ESP8266 firmware for iSpindel relay stations (including GC9A01 240×240 round-TFT relay hardware). It receives readings over WiFi (`POST /gravity`), buffers per-spindle history in flash, renders a dual-hemisphere instrument display on the round TFT, serves an interactive fermentation analytics web UI, syncs with the [iSpindlePlotter](https://github.com/GlassOnTin/iSpindlePlotter) Android app, and forwards readings to cloud or local logging services.
 
+- **Hardware Architecture**: [docs/hardware.md](docs/hardware.md)
 - **Feature Specification**: [docs/features.md](docs/features.md)
 - **HTTP & Configuration Surface**: [docs/protocol.md](docs/protocol.md)
 
