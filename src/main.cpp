@@ -440,6 +440,7 @@ static void handleDebug()
   doc["ledState"] = cfg.ledState;
   doc["tftRotate"] = cfg.tftRotate;
   doc["service"] = cfg.service;
+  doc["forwardStatus"] = lastForwardStatus;
   doc["cursor"] = globalSeqId;
   doc["relayTemp"] = relaySensors.temp;
   doc["relayBar"] = relaySensors.bar;
@@ -464,6 +465,113 @@ static void handleDebug()
   String j;
   serializeJson(doc, j);
   server.send(200, "application/json", j);
+}
+
+static void handleTestForward()
+{
+  StationConfig savedCfg = cfg;
+  SlotState savedSlot1 = slots[1];
+  SlotState savedSlot2 = slots[2];
+  RelaySensorState savedRelay = relaySensors;
+  String savedOverride = mockHttpConnectOverride;
+
+  if (server.hasArg("target"))
+    mockHttpConnectOverride = server.arg("target");
+  if (server.hasArg("service"))
+    cfg.service = server.arg("service").toInt();
+  if (server.hasArg("TOKEN"))
+    cfg.token = server.arg("TOKEN");
+  if (server.hasArg("uri"))
+    cfg.uri = server.arg("uri");
+  if (server.hasArg("uri_custom"))
+    cfg.uriCustom = server.arg("uri_custom");
+  if (server.hasArg("server_address"))
+    cfg.serverAddress = server.arg("server_address");
+  if (server.hasArg("grainfather_uri1"))
+    cfg.grainfatherUri1 = server.arg("grainfather_uri1");
+  if (server.hasArg("grainfather_uri2"))
+    cfg.grainfatherUri2 = server.arg("grainfather_uri2");
+  if (server.hasArg("littlebock_uri1"))
+    cfg.littlebockUri1 = server.arg("littlebock_uri1");
+  if (server.hasArg("littlebock_uri2"))
+    cfg.littlebockUri2 = server.arg("littlebock_uri2");
+  if (server.hasArg("ap_ssid"))
+    cfg.apSsid = server.arg("ap_ssid");
+  if (server.hasArg("mqtt_user"))
+    cfg.mqttUser = server.arg("mqtt_user");
+  if (server.hasArg("mqtt_pass"))
+    cfg.mqttPass = server.arg("mqtt_pass");
+  if (server.hasArg("ispindel_num"))
+    cfg.ispindelNum = server.arg("ispindel_num").toInt();
+  if (server.hasArg("unit_1"))
+    cfg.unit[1] = server.arg("unit_1").toInt();
+  if (server.hasArg("unit_2"))
+    cfg.unit[2] = server.arg("unit_2").toInt();
+  if (server.hasArg("temp_yesno"))
+    cfg.tempYesNo = server.arg("temp_yesno").toInt();
+  if (server.hasArg("temp_unit"))
+    cfg.tempUnit = server.arg("temp_unit").toInt();
+  if (server.hasArg("pressure_unit"))
+    cfg.pressureUnit = server.arg("pressure_unit").toInt();
+  if (server.hasArg("relay_temp"))
+    relaySensors.temp = server.arg("relay_temp").toFloat();
+  if (server.hasArg("relay_bar"))
+    relaySensors.bar = server.arg("relay_bar").toFloat();
+  if (server.hasArg("relay_psi"))
+    relaySensors.psi = server.arg("relay_psi").toFloat();
+
+  String mode = server.arg("mode");
+  bool ok = false;
+  if (mode == "periodic")
+  {
+    ok = sendPeriodicRelaySensor(COL_OK, COL_WARN, COL_SG, true);
+  }
+  else
+  {
+    String body = server.arg("plain");
+    if (body.isEmpty())
+      body = "{\"name\":\"1-Test\",\"ID\":12345,\"angle\":45.2,\"temperature\":20.5,\"temp_units\":\"C\",\"battery\":4.05,\"gravity\":1.048,\"interval\":900,\"RSSI\":-62}";
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, body);
+    String name = doc["name"] | "1-Test";
+    int slot = name.startsWith("2") ? 2 : 1;
+    SlotState &st = slots[slot];
+    st.active = true;
+    st.name = name;
+    st.rawSg = doc["gravity"] | 1.048f;
+    st.corrSg = st.rawSg + cfg.sgOffset[slot];
+    st.rawTemp = doc["temperature"] | 20.5f;
+    st.corrTemp = st.rawTemp + cfg.tempOffset[slot];
+    st.batt = doc["battery"] | 4.05f;
+    st.angle = doc["angle"] | 45.2f;
+    st.rssi = doc["RSSI"] | -62;
+    st.interval = doc["interval"] | 900U;
+    const char *tu = doc["temp_units"] | "C";
+    st.tempUnit = (tu && tu[0]) ? tu[0] : 'C';
+    if (server.hasArg("OG"))
+    {
+      cfg.og[slot] = server.arg("OG").toFloat();
+      st.ogLocked = true;
+    }
+    ok = forwardOnReceipt(slot, body, COL_OK, COL_WARN, COL_SG, true);
+  }
+
+  if (cfg.service == 9 && mqttClient.connected())
+    mqttClient.disconnect();
+
+  String statusOut = lastForwardStatus;
+  mockHttpConnectOverride = savedOverride;
+  cfg = savedCfg;
+  slots[1] = savedSlot1;
+  slots[2] = savedSlot2;
+  relaySensors = savedRelay;
+
+  DynamicJsonDocument resp(256);
+  resp["ok"] = ok;
+  resp["status"] = statusOut;
+  String out;
+  serializeJson(resp, out);
+  server.send(200, "application/json", out);
 }
 
 static void handleReboot()
@@ -602,6 +710,7 @@ void setup()
   server.on("/graph/2.svg", HTTP_GET, []() { serveGraph(2); });
   server.on("/health", HTTP_GET, handleHealth);
   server.on("/debug", HTTP_GET, handleDebug);
+  server.on("/api/test_forward", HTTP_ANY, handleTestForward);
   server.on("/redraw", HTTP_GET, []() {
     if (server.hasArg("rot"))
     {

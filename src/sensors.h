@@ -84,7 +84,7 @@ static void pollRelayTemperature()
     float raw = (cfg.tempUnit == 2) ? ds18b20.getTempFByIndex(0) : ds18b20.getTempCByIndex(0);
     float resetVal = (cfg.tempUnit == 2) ? 185.0f : 85.0f;
 
-    // Stock 6-strike fault debounce
+    // 6-strike fault debounce
     if (raw <= -100.0f || fabsf(raw - resetVal) < 0.05f || fabsf(raw - 127.0f) < 0.05f)
     {
       if (relaySensors.tempErrorCount < 250)

@@ -1,63 +1,46 @@
-# Device web surface
+# Device Web Surface
 
-The replacement's spec, kept from observed behaviour.
+Specification of the HTTP, mDNS, and configuration endpoints served by `iSpindleStation`.
 
-## Received payload
+## Received Payload (`POST /gravity`)
 
-`POST /gravity` accepts the classic iSpindel generic-HTTP JSON. Keys
-observed: `name`, `ID`, `angle`, `temperature`, `temp_units`, `battery`,
-`gravity`, `interval`, `RSSI`, plus a `token` when the sender includes one
-(ignored here).
+`POST /gravity` (as well as any unregistered `POST` path) accepts the standard iSpindel generic-HTTP JSON payload:
+- Standard keys: `name`, `ID`, `angle`, `temperature`, `temp_units`, `battery`, `gravity`, `interval`, `RSSI`, plus optional `token`.
+- Extended `ispindle-proxy` acknowledgment keys: `cf` (`"trial"`, `"reverted"`, or `"refused"` for pending WiFi trials) and `fa` (`"err"` or `"skip"` for OTA firmware trials).
 
-Slot routing follows the original relay's rule: payload names starting
-`1-` go to slot 1 and `2-` to slot 2 (its firmware validates "iSpindel
-name must start with 1 or 2"). This firmware sends anything else to slot
-0 instead of dropping it.
+Slot routing follows the relay naming convention:
+- Payload names starting with `1` route to Slot 1 (`/1.jsonl`).
+- Payload names starting with `2` route to Slot 2 (`/2.jsonl`).
+- Any other hydrometer name routes to Slot 0 (`/0.jsonl`) when Slots 1 and 2 are occupied.
 
-Response: `{"status":"ok"}`.
+Response:
+- `{"status":"ok"}` by default.
+- `{"status":"ok","cfg":{...}}` when a piggybacked hydrometer configuration or OTA update is armed via `PUT /cfg`.
 
-## Served by iSpindleStation (v0)
+## HTTP Endpoints
 
-| Route | Method | What |
-|---|---|---|
-| `/` | GET | live page; last reading per slot; 30 s meta refresh |
-| `/gravity` | POST | receive (any unregistered POST path also lands here) |
-| `/data/0.jsonl`…`/data/2.jsonl` | GET | full history, one `{"ts":…,"payload":{…}}` line per reading |
-| `/graph/0.svg`…`/graph/2.svg` | GET | server-rendered SG polyline, last 400 points |
-| `/health` | GET | firmware version, epoch, sntp state |
+| Route | Method | Description |
+| :--- | :--- | :--- |
+| `/` (`/status`, `/hidro`) | `GET` | Live dashboard with dual-slot cards, relay sensor status, fermentation analytics, interactive chart, and calibration calculator |
+| `/api/status` | `GET` | Full JSON state snapshot for browser polling |
+| `/gravity` | `POST` | Ingest iSpindel reading, persist to JSONL, update TFT display, and trigger configured forwarder |
+| `/readings?since=N` | `GET` | Monotonic cursor catch-up feed (`{"cursor":M,"readings":[{id,ts,ip,payload},...]}`) for the `iSpindlePlotter` Android app |
+| `/cfg` | `GET`, `PUT`, `DELETE` | View, arm, or clear piggybacked iSpindel config (`POLY`, `sleep`, one-shot `SSID`+`PSK`, one-shot `fw` OTA) |
+| `/fw`, `/fw.bin` | `GET` | Metadata (`{size, md5}`) and binary stream for staged iSpindel firmware (`/ispindel_fw.bin`) |
+| `/exclusions` | `GET`, `PUT` | Load or save bad-data exclusion time ranges (`/exclusions.json`) |
+| `/data/0.jsonl`..`/data/2.jsonl` | `GET` | Per-slot append-only NDJSON history |
+| `/graph/0.svg`..`/graph/2.svg` | `GET` | Server-rendered fallback SVG specific-gravity polyline |
+| `/network`, `/config`, `/managment`, `/info` | `GET` | Configuration pages for Network & Cloud, Relay Hardware, iSpindel Calibration/Alarms, and System Info |
+| `/get`, `/save_config`, `/save_management`, `/i_get` | `GET` | Merge-save query parameters into `/config.json` and apply runtime settings |
+| `/new_fermentation` | `GET`, `POST` | Reset OG lock and fermentation state for `ispindel=1\|2` (or `isp=1\|2`) |
+| `/update` | `GET`, `POST` | Web OTA firmware upload for the relay station |
+| `/reboot`, `/reset` | `GET`, `POST` | Schedule a clean reboot (`1 s`) or factory-reset `/config.json` and logs |
+| `/health`, `/debug` | `GET` | JSON diagnostics (firmware version, SNTP epoch, heap, SPIFFS state, forwarder status, slot ages) |
 
-Timestamps are epoch seconds from SNTP; records stamped before SNTP has
-reached the box carry uptime seconds instead (flagged, not silently
-mixed — `/health` reports `sntp`).
+## Configuration Fields (`/config.json`)
 
-## Original relay surface (observed on hardware)
+- **Network & Cloud (`/network`)**: `ssid`, `password`, `ap_ssid`, `ap_pass`, `service` (`0..11`, `255` = None), `TOKEN`, `server_address`, `uri`, `custom_period`, `uri_custom`, `grainfather_uri1`, `grainfather_uri2`, `littlebock_uri1`, `littlebock_uri2`, `mqtt_user`, `mqtt_pass`.
+- **Relay Hardware (`/config`)**: `tft_rotate` (`0..3`), `ledState` (`0..1`), `buzz_yesno` (`1` = Off, `2` = On), `temp_yesno` (`1` = Off, `2` = On), `temp_unit` (`1` = °C, `2` = °F), `TempCorrection1`, `alarm_3`, `alarm_4`, `pressure_unit` (`1` = Bar, `2` = Psi, `3` = Off), `minpressure`, `maxpressure`, `maxpressure_bar`, `pressure_alarm_low`, `pressure_alarm_high`.
+- **Per-iSpindel (`/managment`)**: `ispindel_num` (`1..2`), `unit_1`, `unit_2` (`1` = SG, `2` = Plato), `SGkorekcija1`, `SGkorekcija2`, `Tempkorekcija1`, `Tempkorekcija2`, `OG1`, `OG2`, `alarm_1`, `alarm_2`, `alarm_5`, `alarm_6`, `alarm_SG1`, `alarm_SG2`.
 
-Routes: `/network` (network + cloud), `/managment` (per-iSpindel), `/config`
-(device), `/hidro` (live data), `/update` (manual `.bin` upload), `/reboot`,
-`/reset` (`POST`, factory reset), plus `/get` (network save), `/save_config`,
-`/save_management`, `/new_fermentation` (`POST`, `isp=1/2` with `OG1`/`OG2`,
-"0 = auto detect" — `OG1` inferred from `OG2`'s form).
-
-Network & Cloud form fields: `ssid`, `password`, `ap_ssid`, `ap_pass`,
-`service`; with service HTTP the section adds `TOKEN`, `server_address`,
-`uri`, `custom_period`. Device-config fields: `tft_rotate`, `ledState`,
-`pressure_unit` (Bar=1, Psi=2), `minpressure` (ADC zero), `maxpressure`
-(ADC max), `maxpressure_bar`, `buzz_yesno`, `temp_yesno`, `temp_unit`,
-`alarm_3`, `alarm_4`, `TempCorrection1`. Per-iSpindel fields: `i_broj`,
-`unit_1/2` (SG=1, Plato=2), `alarm_1`..`alarm_4`, `alarm_SG1/SG2`,
-`SGkorekcija1/2`, `Tempkorekcija1/2`; per-spindle URI fields exist for
-Grainfather and Little Bock (`grainfather_uri1/2`, `littlebock_uri1/2`,
-placeholder `/api/log/ispindle/...`).
-
-Forwarders: ubidots (`industrial.api.ubidots.com`,
-`POST /api/v1.6/devices/Nautilis_Thermometer`), brewfather, brewspy,
-grainfather, brewersfriend, littlebock, brewbench, monitor.beer, MQTT.
-
-Known template bug: text-input `value="` attributes are unterminated; in
-the HTTP service section the TOKEN input then swallows the markup that
-should follow, so the Server Address input never renders (both 7.2.4 and
-7.5.0). The `/get` endpoint accepts all fields regardless, which is the
-working configuration path.
-
-Design note carried from the relay's AP configuration: a home LAN in
-192.168.4.x conflicts with the relay AP subnet and breaks forwarding.
+Note: The companion soft-AP runs on `192.168.4.1/24`, so the upstream home WiFi network must use a subnet other than `192.168.4.0/24` for cloud/LAN forwarding to route properly.

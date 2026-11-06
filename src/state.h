@@ -321,7 +321,7 @@ static void updateSlotAnalytics(int s)
     if (st.attenuation < 0.0f)
       st.attenuation = 0.0f;
 
-    // Stock 3-state machine
+    // 3-state fermentation counter
     if (st.prevRawSg > 0.5f && (st.prevRawSg - st.rawSg) > 0.001f)
     {
       st.stockFermState = 1; // Fermenting
