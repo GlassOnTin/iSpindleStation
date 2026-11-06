@@ -4,8 +4,8 @@
 // - Bodmer TFT_eSPI driver for the 240x240 round GC9A01 panel on hardware HSPI
 //   (SCK=14, MOSI=13, CS=0, DC=4, RST=5, BL=15; GPIO12 kept LOW for buzzer).
 // - Two-hemisphere brewery display layout: Slot 1 top, Slot 2 bottom,
-//   48 px tabular SG numerals, ice-cyan temperature, colour-coded battery
-//   and perimeter status arcs, plus centre Wi-Fi/forward heartbeat dot.
+//   FreeSansBold18pt7b SG numerals, FreeSansBold9pt7b ice-cyan temperature
+//   and colour-coded battery, perimeter status arcs, plus centre heartbeat dot.
 // - Boot-time replay of /0.jsonl, /1.jsonl, /2.jsonl so the display and
 //   SVG graphs are populated immediately across power cycles.
 
@@ -25,6 +25,7 @@ static bool fsMounted = false;
 
 #define TFT_BL_PIN 15
 #define BUZZER_PIN 12
+#define GFXFF 1
 
 static TFT_eSPI tft = TFT_eSPI(240, 240);
 
@@ -604,33 +605,30 @@ static void drawSlotHemisphere(bool isTop, int dataSlot)
   uint32_t arcStart = isTop ? 100 : 280;
   uint32_t arcEnd   = isTop ? 260 : 80;
 
-  int yName = isTop ? 28  : 210;
-  // Font 6 has 35 px tall digits at rows 1..35 of its 48 px cell (12 px bottom padding).
-  // Using TL_DATUM places actual digits at ySG+1 .. ySG+35.
-  int ySG   = isTop ? 58  : 138;
-  int yTemp = isTop ? 54  : 134;
-  int yBatt = isTop ? 84  : 164;
-  int xTemp = isTop ? 210 : 214;
-  int xBatt = isTop ? 214 : 210;
+  int yName = isTop ? 35  : 204;
+  int ySG   = isTop ? 78  : 156;
+  int yTemp = isTop ? 68  : 146;
+  int yBatt = isTop ? 93  : 171;
+  int xRight = 190;
 
   // Clear interior of this hemisphere without touching the R=109..113 arc or y=120 divider
   if (isTop)
   {
-    tft.fillRect(50, 16, 140, 26, COL_BG);
-    tft.fillRect(16, 42, 208, 76, COL_BG);
+    tft.fillRect(58, 22, 124, 24, COL_BG);
+    tft.fillRect(28, 46, 184, 70, COL_BG);
   }
   else
   {
-    tft.fillRect(16, 123, 208, 75, COL_BG);
-    tft.fillRect(50, 198, 140, 26, COL_BG);
+    tft.fillRect(28, 124, 184, 68, COL_BG);
+    tft.fillRect(58, 192, 124, 24, COL_BG);
   }
 
   if (dataSlot < 0 || !slotActive[dataSlot])
   {
-    tft.setTextColor(COL_EMPTY);
     tft.setTextDatum(MC_DATUM);
     if (isTop)
     {
+      tft.setTextColor(COL_EMPTY);
       tft.drawString("SLOT 1", 120, yName, 2);
     }
     else
@@ -638,12 +636,15 @@ static void drawSlotHemisphere(bool isTop, int dataSlot)
       String ip = (WiFi.status() == WL_CONNECTED)
                       ? WiFi.localIP().toString()
                       : WiFi.softAPIP().toString();
+      tft.setTextColor(COL_NAME);
       tft.drawString(ip, 120, yName, 2);
     }
-    tft.setTextDatum(TL_DATUM);
-    tft.drawString("-.---", 22, ySG, 6);
+    tft.setTextColor(COL_EMPTY);
+    tft.setFreeFont(&FreeSansBold18pt7b);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString("-.---", 36, ySG, GFXFF);
     tft.setTextDatum(MR_DATUM);
-    tft.drawString(isTop ? "WAITING" : "IDLE", 206, isTop ? 76 : 156, 2);
+    tft.drawString(isTop ? "WAITING" : "IDLE", xRight, ySG, 2);
     tft.drawSmoothArc(120, 120, 113, 109, arcStart, arcEnd, COL_DIVIDER, COL_BG, true);
     return;
   }
@@ -661,42 +662,43 @@ static void drawSlotHemisphere(bool isTop, int dataSlot)
                         ? COL_ALERT
                         : ((stale || batt < 3.70f) ? COL_WARN : COL_OK);
 
-  // 1. Name + Age Badge (with subtle pill background)
+  // 1. Name + Age Badge (with subtle pill background, inside R=106)
   char ageBuf[16];
   formatAge(ageSec, ageBuf, sizeof(ageBuf));
   char hdr[28];
   snprintf(hdr, sizeof(hdr), "%.8s  %s", lastName[dataSlot].c_str(), ageBuf);
-  tft.fillSmoothRoundRect(56, yName - 10, 128, 20, 8, COL_SURFACE, COL_BG);
+  tft.fillSmoothRoundRect(62, yName - 10, 116, 20, 8, COL_SURFACE, COL_BG);
   tft.setTextColor(timeout ? COL_ALERT : (stale ? COL_WARN : COL_NAME));
   tft.setTextDatum(MC_DATUM);
   tft.drawString(hdr, 120, yName, 2);
 
-  // 2. Hero Specific Gravity (Font 6 = 48 px cell, 35 px tall tabular numerals)
-  // Note: '1' in Font 6 has 12 px left padding in its 27 px cell, so x=10 puts visible ink at x=22..130.
+  // 2. Hero Specific Gravity (FreeSansBold18pt7b = 24 px cap height, ~84 px wide)
   char sgBuf[10];
   snprintf(sgBuf, sizeof(sgBuf), "%.3f", sg);
-  int xSG = (sgBuf[0] == '1') ? 10 : 18;
+  tft.setFreeFont(&FreeSansBold18pt7b);
   tft.setTextColor(COL_SG);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawString(sgBuf, xSG, ySG, 6);
+  tft.setTextDatum(ML_DATUM);
+  tft.drawString(sgBuf, 34, ySG, GFXFF);
 
-  // 3. Temperature (Font 4 = 26 px, Ice Cyan, with degree ring)
+  // 3. Temperature (FreeSansBold9pt7b = 12 px cap height, Ice Cyan, with degree ring)
   char unitStr[2] = {lastTempUnit[dataSlot], 0};
   char numBuf[10];
   snprintf(numBuf, sizeof(numBuf), "%.1f", temp);
+  tft.setFreeFont(&FreeSansBold9pt7b);
   tft.setTextColor(COL_TEMP);
-  tft.setTextDatum(TR_DATUM);
-  int uW = tft.drawString(unitStr, xTemp, yTemp, 4);
-  int degX = xTemp - uW - 5;
-  tft.drawSmoothCircle(degX, yTemp + 5, 3, COL_TEMP, COL_BG);
-  tft.drawString(numBuf, degX - 5, yTemp, 4);
+  tft.setTextDatum(MR_DATUM);
+  int uW = tft.drawString(unitStr, xRight, yTemp, GFXFF);
+  int degX = xRight - uW - 4;
+  tft.drawSmoothCircle(degX, yTemp - 3, 2, COL_TEMP, COL_BG);
+  tft.drawString(numBuf, degX - 4, yTemp, GFXFF);
 
-  // 4. Battery Voltage (Font 4 = 26 px, colour-coded)
+  // 4. Battery Voltage (FreeSansBold9pt7b = 12 px cap height, colour-coded)
   char batBuf[12];
   snprintf(batBuf, sizeof(batBuf), "%.2fV", batt);
+  tft.setFreeFont(&FreeSansBold9pt7b);
   tft.setTextColor(battCol);
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(batBuf, xBatt, yBatt, 4);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(batBuf, xRight, yBatt, GFXFF);
 
   // 5. Perimeter Status Arc (drawn last so text boxes never clip it)
   tft.drawSmoothArc(120, 120, 113, 109, arcStart, arcEnd, arcCol, COL_BG, true);
