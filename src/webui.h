@@ -1079,21 +1079,31 @@ static void handleUpdatePostUpload()
   HTTPUpload &upload = server.upload();
   if (upload.status == UPLOAD_FILE_START)
   {
+    if (Update.isRunning())
+      Update.end(false);
     uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
     if (!Update.begin(maxSketchSpace))
       Update.printError(Serial);
   }
   else if (upload.status == UPLOAD_FILE_WRITE)
   {
-    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
-      Update.printError(Serial);
+    if (!Update.hasError())
+    {
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+        Update.printError(Serial);
+    }
   }
   else if (upload.status == UPLOAD_FILE_END)
   {
-    if (Update.end(true))
+    if (!Update.hasError() && Update.end(true))
       Serial.printf("OTA Update Success: %u B\n", upload.totalSize);
     else
       Update.printError(Serial);
+  }
+  else if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    Update.end(false);
+    Serial.println("OTA Update Aborted");
   }
   yield();
 }
