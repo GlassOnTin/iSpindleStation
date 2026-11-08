@@ -7,7 +7,7 @@
 
 <p align="center">
   <a href="https://github.com/GlassOnTin/iSpindleStation/commits/main"><img src="https://img.shields.io/badge/version-v0.4.0-blue?style=flat-square" alt="Version v0.4.0" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-orange?style=flat-square" alt="License AGPL-3.0" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License MIT" /></a>
   <img src="https://img.shields.io/badge/ESP8266-4MB_Flash-e7352c?style=flat-square&logo=espressif&logoColor=white" alt="ESP8266 4MB Flash" />
   <img src="https://img.shields.io/badge/TFT-GC9A01_240%C3%97240-38dbff?style=flat-square" alt="GC9A01 240x240" />
   <img src="https://img.shields.io/badge/Home_Assistant-MQTT_Discovery-41bdf5?style=flat-square&logo=homeassistant&logoColor=white" alt="Home Assistant MQTT Discovery" />
@@ -95,4 +95,4 @@ python3 test/mock_test_forwarders.py
 
 ## License
 
-AGPL-3.0. Vendored: `lib/WiFiManagerKT` — MIT, Ken Taylor's fork of WiFiManager.
+MIT (`LICENSE`). Vendored: `lib/WiFiManagerKT` — MIT, Ken Taylor's fork of WiFiManager.

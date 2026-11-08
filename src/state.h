@@ -559,7 +559,10 @@ static void loadConfig()
   cfg.maxPressure = doc["maxpressure"] | 334;
   cfg.maxPressureBar = doc["maxpressure_bar"] | 1.52f;
   cfg.pressureAlarmLow = doc["pressure_alarm_low"] | 0.0f;
-  cfg.pressureAlarmHigh = doc["pressure_alarm_high"] | 2.0f;
+  cfg.pressureAlarmHigh = doc["pressure_alarm_high"] | ((cfg.pressureUnit == 2) ? 29.0f : 2.0f);
+  // Guard against unscaled 2.00 Bar default left over when switching to Psi
+  if (cfg.pressureUnit == 2 && fabsf(cfg.pressureAlarmHigh - 2.0f) < 0.01f)
+    cfg.pressureAlarmHigh = 29.0f;
 
   cfg.buzzYesNo = doc["buzz_yesno"] | 2;
   cfg.ledState = doc["ledState"] | 1;

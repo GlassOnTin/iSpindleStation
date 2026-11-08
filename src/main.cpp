@@ -191,6 +191,25 @@ static void handleConfigSave()
     if (server.hasArg(k))
       doc[k] = server.arg(k).toFloat();
 
+  // Auto-scale pressure alarm limits if switching between Bar (1/3) and Psi (2)
+  // without manually updating the alarm threshold fields
+  int prevPUnit = cfg.pressureUnit;
+  float prevPHigh = cfg.pressureAlarmHigh;
+  float prevPLow = cfg.pressureAlarmLow;
+  int newPUnit = doc["pressure_unit"] | prevPUnit;
+  float newPHigh = doc["pressure_alarm_high"] | prevPHigh;
+  float newPLow = doc["pressure_alarm_low"] | prevPLow;
+  if (newPUnit == 2 && prevPUnit != 2 && fabsf(newPHigh - prevPHigh) < 0.01f && newPHigh > 0.0f && newPHigh <= 4.0f)
+  {
+    doc["pressure_alarm_high"] = roundf(newPHigh * 14.503768f * 10.0f) / 10.0f;
+    doc["pressure_alarm_low"] = roundf(newPLow * 14.503768f * 10.0f) / 10.0f;
+  }
+  else if (newPUnit == 1 && prevPUnit == 2 && fabsf(newPHigh - prevPHigh) < 0.01f && newPHigh > 4.0f)
+  {
+    doc["pressure_alarm_high"] = roundf((newPHigh / 14.503768f) * 100.0f) / 100.0f;
+    doc["pressure_alarm_low"] = roundf((newPLow / 14.503768f) * 100.0f) / 100.0f;
+  }
+
   File out = SPIFFS.open(CONFIG_PATH, "w");
   if (!out)
   {
@@ -383,7 +402,11 @@ static void serveGraph(int slot)
   const float pad = (hi - lo) < 0.002f ? 0.001f : (hi - lo) * 0.05f;
   lo -= pad;
   hi += pad;
-  const int W = 700, H = 300, M = 44;
+  const int W = 700, H = 310, ML = 56, MR = 24, MT = 20, MB = 48;
+  const int CW = W - ML - MR, CH = H - MT - MB;
+  GraphPoint &oldest = graphRing[slot][start];
+  GraphPoint &newest = graphRing[slot][(start + n - 1) % GRAPH_POINTS];
+  uint32_t spanSec = (newest.ts > oldest.ts) ? (newest.ts - oldest.ts) : 1;
   String pts;
   if (!pts.reserve(n * 14))
   {
@@ -394,22 +417,53 @@ static void serveGraph(int slot)
   {
     GraphPoint &p = graphRing[slot][(start + i) % GRAPH_POINTS];
     float v = ensureSg(unpackGraphSg(p) + cfg.sgOffset[cfgIdx]);
-    float x = M + (W - 2 * M) * (n == 1 ? 0.5f : (float)i / (float)(n - 1));
-    float y = H - M - (H - 2 * M) * ((v - lo) / (hi - lo));
+    float fracX = (n == 1) ? 0.5f : ((newest.ts > oldest.ts) ? (float)(p.ts - oldest.ts) / (float)spanSec : (float)i / (float)(n - 1));
+    float x = ML + CW * fracX;
+    float y = MT + CH * (1.0f - (v - lo) / (hi - lo));
     if (i)
       pts += ' ';
     pts += String((int)x) + "," + String(y, 1);
   }
   String strokeCol = (slot == 2) ? "#ffea00" : "#00e676";
-  String svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " +
-               String(W) + " " + String(H) + "' style='max-width:100%'>"
-               "<rect width='" + String(W) + "' height='" + String(H) + "' fill='#14191e'/>"
-               "<polyline fill='none' stroke='" + strokeCol + "' stroke-width='2' points='" + pts + "'/>";
-  GraphPoint &oldest = graphRing[slot][start];
-  GraphPoint &newest = graphRing[slot][(start + n - 1) % GRAPH_POINTS];
-  svg += "<text x='" + String(M) + "' y='" + String(H - 12) + "' fill='#8b949e' font-size='12'>";
+  String svg;
+  svg.reserve(pts.length() + 1400);
+  svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " +
+        String(W) + " " + String(H) + "' style='max-width:100%;font-family:sans-serif'>"
+        "<rect width='" + String(W) + "' height='" + String(H) + "' fill='#14191e'/>";
+  // Horizontal SG gridlines + labels
+  for (int g = 0; g <= 4; g++)
+  {
+    int gy = MT + (CH * g) / 4;
+    float gv = hi - ((hi - lo) * g) / 4.0f;
+    svg += "<line x1='" + String(ML) + "' y1='" + String(gy) + "' x2='" + String(W - MR) + "' y2='" + String(gy) + "' stroke='#232b34'/>";
+    svg += "<text x='6' y='" + String(gy + 4) + "' fill='#8b949e' font-size='11'>" + String(gv, 3) + "</text>";
+  }
+  // Vertical time gridlines + X-axis labels
+  float spanH = (float)spanSec / 3600.0f;
+  for (int t = 0; t <= 4; t++)
+  {
+    int tx = ML + (CW * t) / 4;
+    float th = (spanH * t) / 4.0f;
+    svg += "<line x1='" + String(tx) + "' y1='" + String(MT) + "' x2='" + String(tx) + "' y2='" + String(MT + CH) + "' stroke='#232b34'/>";
+    String tLbl = "+" + String(th, 1) + "h";
+    if (oldest.ts > 1600000000UL)
+    {
+      time_t tickTs = (time_t)(oldest.ts + (spanSec * t) / 4);
+      struct tm *tmInfo = localtime(&tickTs);
+      if (tmInfo)
+      {
+        char buf[20];
+        snprintf(buf, sizeof(buf), "%02d:%02d (+%.1fh)", tmInfo->tm_hour, tmInfo->tm_min, th);
+        tLbl = buf;
+      }
+    }
+    const char *anchor = (t == 0) ? "start" : ((t == 4) ? "end" : "middle");
+    svg += "<text x='" + String(tx) + "' y='" + String(MT + CH + 18) + "' fill='#8b949e' font-size='11' text-anchor='" + anchor + "'>" + tLbl + "</text>";
+  }
+  svg += "<polyline fill='none' stroke='" + strokeCol + "' stroke-width='2' points='" + pts + "'/>";
+  svg += "<text x='" + String(ML) + "' y='" + String(H - 8) + "' fill='#8b949e' font-size='11'>";
   svg += "SG " + String(lo + pad, 4) + " .. " + String(hi - pad, 4) +
-         " (" + String(n) + " pts, span " + String((uint32_t)(newest.ts - oldest.ts)) + " s)";
+         " (" + String(n) + " pts, span " + String(spanH, 1) + " h)";
   svg += "</text></svg>";
   server.send(200, "image/svg+xml", svg);
 }
@@ -737,6 +791,9 @@ void loop()
 
   if (rebootScheduled && (millis() - rebootScheduledAt) >= 1000UL)
   {
+    digitalWrite(TFT_BL_PIN, LOW);
+    pinMode(TFT_BL_PIN, INPUT);
+    pinMode(ONEWIRE_PIN, INPUT_PULLUP);
     delay(100);
     ESP.restart();
   }

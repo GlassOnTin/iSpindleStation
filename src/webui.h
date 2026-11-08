@@ -38,7 +38,7 @@ button,.btn{display:inline-block;padding:8px 14px;border-radius:6px;border:none;
 button.sec,.btn.sec{background:#2c353f;color:var(--txt)}
 button.danger,.btn.danger{background:var(--err);color:#fff}
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-canvas{width:100%;height:260px;background:#14191e;border-radius:8px;border:1px solid var(--bdr);display:block;touch-action:none}
+canvas{width:100%;height:285px;background:#14191e;border-radius:8px;border:1px solid var(--bdr);display:block;touch-action:none}
 .sub{font-size:.82rem;color:var(--mut);margin-top:6px}
 table{width:100%;border-collapse:collapse;font-size:.86rem;margin-top:8px}
 th,td{border-bottom:1px solid var(--bdr);padding:6px;text-align:left}
@@ -326,12 +326,13 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       ctx.fillText("No readings recorded for this slot yet.", 20, H/2);
       return;
     }
-    const padL = 52, padR = 46, padT = 18, padB = 28;
+    const padL = 52, padR = 46, padT = 18, padB = 42;
     const cw = W - padL - padR, ch = H - padT - padB;
     const t0 = pts[0].ts;
     const hours = pts.map(p => (p.ts - t0)/3600);
+    const lastObsH = hours[hours.length-1];
     const gomp = analysis.gompertz;
-    const maxH = Math.max(hours[hours.length-1], gomp && gomp.etaH ? hours[hours.length-1] + Math.min(gomp.etaH, 72) : hours[hours.length-1], 1);
+    const maxH = Math.max(lastObsH, gomp && gomp.etaH ? lastObsH + Math.min(gomp.etaH, 72) : lastObsH, 1);
 
     let minSg = Math.min(...pts.map(p=>p.sg)), maxSg = Math.max(...pts.map(p=>p.sg));
     if (gomp) { minSg = Math.min(minSg, gomp.fg - gomp.fgSigma); maxSg = Math.max(maxSg, gomp.og); }
@@ -341,7 +342,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const xOf = h => padL + (h / maxH) * cw;
     const yOf = sg => padT + (1 - (sg - minSg)/(maxSg - minSg)) * ch;
 
-    // Gridlines
+    // Horizontal SG gridlines + Y-axis labels
     ctx.strokeStyle = "#232b34"; ctx.lineWidth = 1;
     for (let i=0; i<=4; i++) {
       const y = padT + (i/4)*ch;
@@ -349,6 +350,44 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(W-padR, y); ctx.stroke();
       ctx.fillStyle = "#8b949e"; ctx.font = "11px sans-serif";
       ctx.fillText(v.toFixed(3), 6, y + 4);
+    }
+
+    // Vertical time gridlines + X-axis ticks & labels
+    const nTicks = Math.max(4, Math.min(6, Math.floor(cw / 105)));
+    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    const pad2 = n => (n < 10 ? "0" + n : "" + n);
+    for (let i=0; i<=nTicks; i++) {
+      const h = (i / nTicks) * maxH;
+      const x = xOf(h);
+      ctx.strokeStyle = "#232b34"; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
+      ctx.strokeStyle = "#485460";
+      ctx.beginPath(); ctx.moveTo(x, padT + ch); ctx.lineTo(x, padT + ch + 4); ctx.stroke();
+
+      ctx.fillStyle = "#8b949e"; ctx.font = "10.5px sans-serif";
+      ctx.textAlign = (i === 0) ? "left" : ((i === nTicks) ? "right" : "center");
+      const hLbl = `+${h < 10 ? h.toFixed(1) : Math.round(h)}h`;
+      if (t0 > 1000000000) {
+        const d = new Date((t0 + h * 3600) * 1000);
+        const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+        const topLbl = maxH >= 24 ? `${d.getDate()} ${months[d.getMonth()]} ${hm}` : hm;
+        ctx.fillText(topLbl, x, padT + ch + 15);
+        ctx.fillStyle = "#6e7681"; ctx.font = "10px sans-serif";
+        ctx.fillText(hLbl, x, padT + ch + 28);
+      } else {
+        ctx.fillText(hLbl, x, padT + ch + 16);
+      }
+    }
+    ctx.textAlign = "left";
+
+    // Mark "Now" divider when forward Gompertz projection extends beyond observations
+    if (maxH > lastObsH + 0.5 && lastObsH > 0) {
+      const nx = xOf(lastObsH);
+      ctx.strokeStyle = "rgba(230,237,243,0.35)"; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(nx, padT); ctx.lineTo(nx, padT + ch); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#8b949e"; ctx.font = "10px sans-serif";
+      ctx.fillText("Now", Math.min(nx + 4, W - padR - 26), padT + ch - 5);
     }
 
     // Shade detected plateaus (Lag / Mid diauxic / Tail)
@@ -899,7 +938,7 @@ static void handleConfigPage()
   p += String(cfg.alarmRelayTempLow);
   p += F("'><input name='alarm_4' type='number' value='");
   p += String(cfg.alarmRelayTempHigh);
-  p += F("'></div></div><div><label>Onboard Pressure Sensor (A0)</label><select name='pressure_unit'>"
+  p += F("'></div></div><div><label>Onboard Pressure Sensor (A0)</label><select name='pressure_unit' id='pUnitSel' onchange='onPUnit(this.value)'>"
          "<option value='3'");
   if (cfg.pressureUnit == 3) p += F(" selected");
   p += F(">Off</option><option value='1'");
@@ -914,15 +953,23 @@ static void handleConfigPage()
   p += F("'></div><label>Full-Scale Pressure (Bar at maxpressure ADC)</label>"
          "<input name='maxpressure_bar' type='number' step='0.01' value='");
   p += String(cfg.maxPressureBar, 2);
-  p += F("'><label>Pressure Alarm Low / High</label><div style='display:flex;gap:6px'>"
-         "<input name='pressure_alarm_low' type='number' step='0.05' value='");
+  p += F("'><label id='pAlarmLbl'>Pressure Alarm Low / High (");
+  p += (cfg.pressureUnit == 2) ? F("Psi") : F("Bar");
+  p += F(")</label><div style='display:flex;gap:6px'>"
+         "<input id='pLow' name='pressure_alarm_low' type='number' step='0.05' value='");
   p += String(cfg.pressureAlarmLow, 2);
-  p += F("'><input name='pressure_alarm_high' type='number' step='0.05' value='");
+  p += F("'><input id='pHigh' name='pressure_alarm_high' type='number' step='0.05' value='");
   p += String(cfg.pressureAlarmHigh, 2);
   p += F("'></div><div class='sub' style='margin-top:12px'>Live A0 ADC: <b>");
   p += String(relaySensors.rawAdc) + F("</b> (") + String(relaySensors.voltage, 2) +
        F(" V) &rarr; ") + String(relaySensors.bar, 2) + F(" bar / ") + String(relaySensors.psi, 1) +
-       F(" psi</div></div></div><button type='submit'>Save Hardware Config</button></form></div></div></body></html>");
+       F(" psi</div></div></div><button type='submit'>Save Hardware Config</button></form>"
+         "<script>var curPU=");
+  p += String(cfg.pressureUnit);
+  p += F(";function onPUnit(v){v=parseInt(v);var lbl=document.getElementById('pAlarmLbl'),lo=document.getElementById('pLow'),hi=document.getElementById('pHigh');"
+         "if(v===2&&curPU!==2){lbl.textContent='Pressure Alarm Low / High (Psi)';if(parseFloat(hi.value)<=4.0){hi.value=(parseFloat(hi.value)*14.5038).toFixed(1);lo.value=(parseFloat(lo.value)*14.5038).toFixed(1);}}"
+         "else if(v===1&&curPU===2){lbl.textContent='Pressure Alarm Low / High (Bar)';if(parseFloat(hi.value)>4.0){hi.value=(parseFloat(hi.value)/14.5038).toFixed(2);lo.value=(parseFloat(lo.value)/14.5038).toFixed(2);}}"
+         "if(v!==3)curPU=v;}</script></div></div></body></html>");
   server.send(200, "text/html", p);
 }
 
@@ -1021,6 +1068,7 @@ static void handleUpdatePostDone()
                    "<h2>OTA Update Failed</h2><a href='/update' style='color:#38dbff'>Back</a></body></html>");
   if (ok)
   {
+    digitalWrite(TFT_BL_PIN, LOW);
     rebootScheduled = true;
     rebootScheduledAt = millis();
   }
