@@ -61,7 +61,7 @@ static const char NAV_BAR[] PROGMEM = R"rawliteral(
 // ---- Client-side iSpindlePlotter Analytics Engine (/app.js in PROGMEM) ----
 static const char APP_JS[] PROGMEM = R"rawliteral(
 (function(){
-  let state = { slot: 1, points: [], exclusions: [], segments: [], segIdx: -1, cursorIdx: null, status: null, calPts: [] };
+  let state = { slot: 1, points: [], exclusions: [], segments: [], segIdx: -1, cursorH: null, chartMinH: 0, chartMaxH: 1, showPreStart: true, status: null, calPts: [] };
 
   function ensureSg(v) {
     if (!v || v <= 0.5) return 0;
@@ -199,14 +199,24 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
               const r = gompertzEval(ogTry, fgTry, muTry, lamTry, wH[i]) - wS[i];
               rss += r * r;
             }
-            if (!best || rss < best.rss) best = { rss, og: ogTry, fg: fgTry, mu: muTry, lam: lamTry };
+            if (!best || rss < best.rss) best = { rss, og: ogTry, fg: fgTry, mu: muTry, lam: lamTry, k };
           }
         }
         if (best) {
           const rmse = Math.sqrt(best.rss / wH.length);
           const fgSigma = Math.max(0.0006, rmse * 1.5);
           const ogSigma = 1.6 * (best.fg - 1.0);
-          return { og: best.og, fg: best.fg, mu: best.mu, lam: best.lam, fgSigma, ogSigma, ogInferred: true, obsStartSg: ogFixed, etaH: null };
+          const mkBand = (atten, dfg) => {
+            const fgi = best.fg + dfg;
+            const ogi = 1.0 + (best.fg - 1.0) / (1.0 - atten);
+            const Ai = Math.max(ogi - fgi, 0.005);
+            const c0i = Math.max(y0 + dfg - fgi, 0.0004);
+            const u0i = Math.log(-Math.log(Math.max(1e-6, 1.0 - Math.min(0.95, c0i / Ai))));
+            return { og: ogi, fg: fgi, mu: best.k * Ai / Math.E, lam: (u0i - 1.0) / best.k };
+          };
+          const loCurve = mkBand(0.67, -1.96 * fgSigma);
+          const hiCurve = mkBand(0.80, 1.96 * fgSigma);
+          return { og: best.og, fg: best.fg, mu: best.mu, lam: best.lam, fgSigma, ogSigma, ogInferred: true, obsStartSg: ogFixed, loCurve, hiCurve, etaH: null };
         }
       }
     }
@@ -394,18 +404,27 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const hours = pts.map(p => (p.ts - t0)/3600);
     const lastObsH = hours[hours.length-1];
     const gomp = analysis.gompertz;
+    const extendPre = Boolean(gomp && gomp.ogInferred && gomp.lam < 0 && state.showPreStart);
+    const minH = extendPre ? Math.max(gomp.lam - 10.0, -96.0) : 0;
     const maxH = Math.max(lastObsH, gomp && gomp.etaH ? lastObsH + Math.min(gomp.etaH, 72) : lastObsH, 1);
+    const spanX = Math.max(maxH - minH, 1);
+    state.chartMinH = minH;
+    state.chartMaxH = maxH;
 
     let minSg = Math.min(...pts.map(p=>p.sg)), maxSg = Math.max(...pts.map(p=>p.sg));
     if (gomp) {
-      const gompTop = gomp.ogInferred ? gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, 0) : gomp.og;
-      minSg = Math.min(minSg, gomp.fg - gomp.fgSigma);
-      maxSg = Math.max(maxSg, gompTop);
+      minSg = Math.min(minSg, gomp.fg - 1.96 * gomp.fgSigma);
+      if (extendPre) {
+        maxSg = Math.max(maxSg, gomp.hiCurve ? gomp.hiCurve.og : gomp.og);
+      } else {
+        const gompTop = gomp.ogInferred ? gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, 0) : gomp.og;
+        maxSg = Math.max(maxSg, gompTop);
+      }
     }
     const sgPad = Math.max((maxSg - minSg)*0.08, 0.002);
     minSg -= sgPad; maxSg += sgPad;
 
-    const xOf = h => padL + (h / maxH) * cw;
+    const xOf = h => padL + ((h - minH) / spanX) * cw;
     const yOf = sg => padT + (1 - (sg - minSg)/(maxSg - minSg)) * ch;
 
     // Horizontal SG gridlines + Y-axis labels
@@ -423,7 +442,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
     const pad2 = n => (n < 10 ? "0" + n : "" + n);
     for (let i=0; i<=nTicks; i++) {
-      const h = (i / nTicks) * maxH;
+      const h = minH + (i / nTicks) * spanX;
       const x = xOf(h);
       ctx.strokeStyle = "#232b34"; ctx.lineWidth = 1;
       ctx.beginPath(); ctx.moveTo(x, padT); ctx.lineTo(x, padT + ch); ctx.stroke();
@@ -432,11 +451,13 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
 
       ctx.fillStyle = "#8b949e"; ctx.font = "10.5px sans-serif";
       ctx.textAlign = (i === 0) ? "left" : ((i === nTicks) ? "right" : "center");
-      const hLbl = `+${h < 10 ? h.toFixed(1) : Math.round(h)}h`;
+      const hClean = Math.abs(h) < 0.05 ? 0 : h;
+      const hSign = hClean > 0 ? "+" : "";
+      const hLbl = `${hSign}${Math.abs(hClean) < 10 && hClean !== 0 ? hClean.toFixed(1) : Math.round(hClean)}h`;
       if (t0 > 1000000000) {
         const d = new Date((t0 + h * 3600) * 1000);
         const hm = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-        const topLbl = maxH >= 24 ? `${d.getDate()} ${months[d.getMonth()]} ${hm}` : hm;
+        const topLbl = spanX >= 24 ? `${d.getDate()} ${months[d.getMonth()]} ${hm}` : hm;
         ctx.fillText(topLbl, x, padT + ch + 15);
         ctx.fillStyle = "#6e7681"; ctx.font = "10px sans-serif";
         ctx.fillText(hLbl, x, padT + ch + 28);
@@ -445,6 +466,30 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       }
     }
     ctx.textAlign = "left";
+
+    // Clip plot region so curves and plateau bands stay cleanly inside axes
+    ctx.save();
+    ctx.beginPath(); ctx.rect(padL, padT, cw, ch); ctx.clip();
+
+    // Mark pre-capture predicted start (lambda) & Capture Start (0h) when extended
+    if (extendPre) {
+      const lx = xOf(gomp.lam);
+      const ly = yOf(gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, gomp.lam));
+      ctx.strokeStyle = "rgba(32,224,96,0.5)"; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(lx, padT); ctx.lineTo(lx, padT + ch); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#20e060";
+      ctx.beginPath(); ctx.arc(lx, ly, 3.5, 0, Math.PI*2); ctx.fill();
+      ctx.font = "10.5px sans-serif";
+      ctx.fillText(`Pred. Start ~${gomp.og.toFixed(3)} (${Math.round(gomp.lam)}h)`, Math.max(padL + 4, lx + 5), Math.max(padT + 12, ly - 6));
+
+      const cx0 = xOf(0);
+      ctx.strokeStyle = "rgba(56,219,255,0.4)"; ctx.lineWidth = 1; ctx.setLineDash([3,3]);
+      ctx.beginPath(); ctx.moveTo(cx0, padT); ctx.lineTo(cx0, padT + ch); ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "#38dbff"; ctx.font = "10px sans-serif";
+      ctx.fillText("Capture Start", cx0 + 4, padT + ch - 6);
+    }
 
     // Mark "Now" divider when forward Gompertz projection extends beyond observations
     if (maxH > lastObsH + 0.5 && lastObsH > 0) {
@@ -466,19 +511,26 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       ctx.fillText(`${p.kind} ${p.durationH.toFixed(1)}h`, x1 + 3, padT + 12);
     }
 
-    // Gompertz curve & 95% credible band
+    // Gompertz curve & Bayesian credible band across [minH, maxH]
     if (gomp) {
+      const steps = 90;
+      const evalLo = h => (gomp.ogInferred && gomp.loCurve)
+        ? gompertzEval(gomp.loCurve.og, gomp.loCurve.fg, gomp.loCurve.mu, gomp.loCurve.lam, h)
+        : gompertzEval(gomp.og, gomp.fg - 1.96*gomp.fgSigma, gomp.mu, gomp.lam, h);
+      const evalHi = h => (gomp.ogInferred && gomp.hiCurve)
+        ? gompertzEval(gomp.hiCurve.og, gomp.hiCurve.fg, gomp.hiCurve.mu, gomp.hiCurve.lam, h)
+        : gompertzEval(gomp.og, gomp.fg + 1.96*gomp.fgSigma, gomp.mu, gomp.lam, h);
+
       ctx.fillStyle = "rgba(32,224,96,0.13)";
       ctx.beginPath();
-      const steps = 60;
       for (let s=0; s<=steps; s++) {
-        const h = (s/steps)*maxH;
-        const y = gompertzEval(gomp.og, gomp.fg - 1.96*gomp.fgSigma, gomp.mu, gomp.lam, h);
+        const h = minH + (s/steps)*spanX;
+        const y = evalLo(h);
         s===0 ? ctx.moveTo(xOf(h), yOf(y)) : ctx.lineTo(xOf(h), yOf(y));
       }
       for (let s=steps; s>=0; s--) {
-        const h = (s/steps)*maxH;
-        const y = gompertzEval(gomp.og, gomp.fg + 1.96*gomp.fgSigma, gomp.mu, gomp.lam, h);
+        const h = minH + (s/steps)*spanX;
+        const y = evalHi(h);
         ctx.lineTo(xOf(h), yOf(y));
       }
       ctx.closePath(); ctx.fill();
@@ -486,7 +538,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       ctx.strokeStyle = "#20e060"; ctx.lineWidth = 1.6; ctx.setLineDash([4,4]);
       ctx.beginPath();
       for (let s=0; s<=steps; s++) {
-        const h = (s/steps)*maxH;
+        const h = minH + (s/steps)*spanX;
         const y = gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, h);
         s===0 ? ctx.moveTo(xOf(h), yOf(y)) : ctx.lineTo(xOf(h), yOf(y));
       }
@@ -503,9 +555,6 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       idx===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
     });
     ctx.stroke();
-    ctx.fillStyle = "#ff8c42"; ctx.font = "11px sans-serif";
-    ctx.fillText(maxT.toFixed(1)+"°", W-padR+4, padT+10);
-    ctx.fillText(minT.toFixed(1)+"°", W-padR+4, padT+ch);
 
     // SG polyline + points
     ctx.strokeStyle = "#38dbff"; ctx.lineWidth = 2;
@@ -515,17 +564,41 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       idx===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
     });
     ctx.stroke();
+    ctx.restore();
 
-    // Cursor overlay
-    if (state.cursorIdx !== null && pts[state.cursorIdx]) {
-      const ci = state.cursorIdx, cp = pts[ci];
-      const cx = xOf(hours[ci]), cy = yOf(cp.sg);
-      ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+ch); ctx.stroke();
-      ctx.fillStyle = "#38dbff"; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI*2); ctx.fill();
-      const dt = new Date(cp.ts * 1000).toLocaleString();
-      document.getElementById("cursorReadout").textContent =
-        `Cursor [${ci+1}/${pts.length}] ${dt} (+${hours[ci].toFixed(1)}h): SG ${cp.sg.toFixed(4)} | Temp ${cp.temp.toFixed(1)}° | Batt ${cp.batt.toFixed(2)}V | Tilt ${cp.angle.toFixed(2)}°`;
+    ctx.fillStyle = "#ff8c42"; ctx.font = "11px sans-serif";
+    ctx.fillText(maxT.toFixed(1)+"°", W-padR+4, padT+10);
+    ctx.fillText(minT.toFixed(1)+"°", W-padR+4, padT+ch);
+
+    // Cursor overlay (supports both pre-capture predicted region and captured telemetry)
+    if (state.cursorH !== null) {
+      if (extendPre && state.cursorH < -0.1) {
+        const chH = Math.max(minH, state.cursorH);
+        const predSg = gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, chH);
+        const loSg = gomp.loCurve ? gompertzEval(gomp.loCurve.og, gomp.loCurve.fg, gomp.loCurve.mu, gomp.loCurve.lam, chH) : predSg - 1.96*gomp.fgSigma;
+        const hiSg = gomp.hiCurve ? gompertzEval(gomp.hiCurve.og, gomp.hiCurve.fg, gomp.hiCurve.mu, gomp.hiCurve.lam, chH) : predSg + 1.96*gomp.fgSigma;
+        const cx = xOf(chH), cy = yOf(predSg);
+        ctx.strokeStyle = "rgba(32,224,96,0.8)"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+ch); ctx.stroke();
+        ctx.fillStyle = "#20e060"; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI*2); ctx.fill();
+        const dt = t0 > 1000000000 ? new Date((t0 + chH * 3600) * 1000).toLocaleString() : "";
+        document.getElementById("cursorReadout").textContent =
+          `Predicted Pre-Capture ${dt} (${chH.toFixed(1)}h): Model SG ${predSg.toFixed(4)} (67–80% atten band ${loSg.toFixed(3)}..${hiSg.toFixed(3)})`;
+      } else {
+        let ci = 0, bestD = 1e9;
+        for (let i=0; i<hours.length; i++) {
+          const d = Math.abs(hours[i] - state.cursorH);
+          if (d < bestD) { bestD = d; ci = i; }
+        }
+        const cp = pts[ci];
+        const cx = xOf(hours[ci]), cy = yOf(cp.sg);
+        ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(cx, padT); ctx.lineTo(cx, padT+ch); ctx.stroke();
+        ctx.fillStyle = "#38dbff"; ctx.beginPath(); ctx.arc(cx, cy, 4, 0, Math.PI*2); ctx.fill();
+        const dt = new Date(cp.ts * 1000).toLocaleString();
+        document.getElementById("cursorReadout").textContent =
+          `Cursor [${ci+1}/${pts.length}] ${dt} (+${hours[ci].toFixed(1)}h): SG ${cp.sg.toFixed(4)} | Temp ${cp.temp.toFixed(1)}° | Batt ${cp.batt.toFixed(2)}V | Tilt ${cp.angle.toFixed(2)}°`;
+      }
     }
   }
 
@@ -566,12 +639,21 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
         spBox.innerHTML = `<span class="sub">Spunding guidance activates once OG and descent are established.</span>`;
       }
     }
+    const zBtn = document.getElementById("preZoomBtn");
+    if (zBtn) {
+      if (an.gompertz && an.gompertz.ogInferred && an.gompertz.lam < 0) {
+        zBtn.style.display = "inline-block";
+        zBtn.textContent = state.showPreStart ? "Zoom: Captured" : "Show Pred. Start";
+      } else {
+        zBtn.style.display = "none";
+      }
+    }
     drawChart("sgCanvas", an, viewPts);
     state.viewPts = viewPts;
   }
 
   async function loadSlot(s) {
-    state.slot = s; state.cursorIdx = null;
+    state.slot = s; state.cursorH = null;
     const [ndjson, exclRes] = await Promise.all([
       fetch(`/data/${s}.jsonl`).then(r => r.text()),
       fetch(`/exclusions`).then(r => r.json()).catch(()=>[])
@@ -701,6 +783,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
   window.selectSlot = s => loadSlot(s);
   window.prevSeg = () => { if (state.segments.length && state.segIdx > 0) { state.segIdx--; renderActiveView(); } };
   window.nextSeg = () => { if (state.segments.length && state.segIdx < state.segments.length) { state.segIdx++; renderActiveView(); } };
+  window.togglePreZoom = () => { state.showPreStart = !state.showPreStart; state.cursorH = null; renderActiveView(); };
 
   window.addEventListener("DOMContentLoaded", () => {
     const cv = document.getElementById("sgCanvas");
@@ -710,7 +793,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
         const rect = cv.getBoundingClientRect();
         const clientX = (e.touches && e.touches[0]) ? e.touches[0].clientX : e.clientX;
         const rel = Math.max(0, Math.min(1, (clientX - rect.left - 52) / Math.max(rect.width - 98, 1)));
-        state.cursorIdx = Math.min(state.viewPts.length - 1, Math.floor(rel * state.viewPts.length));
+        state.cursorH = state.chartMinH + rel * (state.chartMaxH - state.chartMinH);
         renderActiveView();
       };
       cv.addEventListener("mousemove", onMove);
@@ -745,9 +828,10 @@ static const char DASHBOARD_BODY[] PROGMEM = R"rawliteral(
       <button class="sec" onclick="selectSlot(2)">Slot 2</button>
       <button class="sec" onclick="selectSlot(0)">Slot 0 (Unprefixed)</button>
       <span style="margin-left:auto;display:flex;gap:6px;align-items:center">
-        <button class="sec" onclick="prevSeg()">&#9664;</button>
+        <button id="preZoomBtn" class="sec" onclick="togglePreZoom()" style="display:none;margin-top:0">Zoom: Captured</button>
+        <button class="sec" onclick="prevSeg()" style="margin-top:0">&#9664;</button>
         <span id="segLabel" style="font-size:.86rem">All</span>
-        <button class="sec" onclick="nextSeg()">&#9654;</button>
+        <button class="sec" onclick="nextSeg()" style="margin-top:0">&#9654;</button>
       </span>
     </div>
     <p id="phaseDesc" style="margin:6px 0 10px;font-size:.92rem"></p>
