@@ -102,7 +102,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       for (let j=i-1; j>=0 && (pts[i-1].ts - pts[j].ts) <= 21600; j--) {
         if (pts[j].sg > max6h) max6h = pts[j].sg;
       }
-      if (dtH > 8.0 && dSg > 0.004) { cuts.push(i); continue; }
+      if (dtH > 8.0 && dSg > 0.004 && pts[i].sg > max6h + 0.001) { cuts.push(i); continue; }
       if (dSg > 0.005 && pts[i].sg > max6h + 0.002) { cuts.push(i); }
     }
     cuts.push(pts.length);
@@ -114,7 +114,7 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
       if (spanH < 2.0) continue;
       let lo = 99, hi = 0;
       for (let k=a; k<=b; k++) { if (pts[k].sg < lo) lo = pts[k].sg; if (pts[k].sg > hi) hi = pts[k].sg; }
-      if (hi - lo >= 0.003 || c === cuts.length-2) {
+      if (hi - lo >= 0.003 && pts[a].sg > pts[b].sg + 0.001) {
         segs.push({ startIdx: a, endIdx: b, startTs: pts[a].ts, endTs: pts[b].ts, og: hi, fg: lo });
       }
     }
@@ -166,13 +166,15 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const n = hours.length;
     if (n < 8) return null;
     const cur = sgs[n-1];
-    if (ogFixed - cur < 0.003) return null;
+    const minObs = Math.min(...sgs);
+    if (ogFixed - minObs < 0.003) return null;
     const priorFg = Math.max(0.998, 1.0 + 0.25*(ogFixed - 1.0));
-    let fg = Math.min(cur - 0.002, priorFg);
+    const tailMed = median(sgs.slice(-Math.min(12, n)));
+    let fg = Math.min(tailMed, ogFixed - 0.003);
     let mu = 0.0012;
     let lam = Math.max(0, hours[0] + 2.0);
     let damp = 1e-2;
-    const priorWeight = 1.0 / (0.10 * Math.max(ogFixed - 1.0, 0.01));
+    const priorWeight = 0.0005 / (0.10 * Math.max(ogFixed - 1.0, 0.01));
 
     for (let iter=0; iter<35; iter++) {
       let JtJ = [[0,0,0],[0,0,0],[0,0,0]], Jtr = [0,0,0], rss = 0;
