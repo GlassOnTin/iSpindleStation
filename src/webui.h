@@ -161,12 +161,55 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     return og - A * Math.exp(-Math.exp(u));
   }
 
-  // Levenberg-Marquardt MAP fitter with Gaussian attenuation prior N(0.75, 0.10^2)
-  function fitGompertz(hours, sgs, ogFixed) {
+  // Levenberg-Marquardt MAP fitter with Gaussian attenuation prior N(0.75, 0.10^2).
+  // When capture begins mid-fermentation (no lag plateau and observed attenuation < 45%
+  // onto a settled terminal plateau), applies the Bayesian attenuation prior in reverse
+  // from the observed terminal plateau FG to infer pre-capture OG and negative lag time (lam < 0).
+  function fitGompertz(hours, sgs, ogFixed, temps, hasLagPlateau, isTailSettled) {
     const n = hours.length;
     if (n < 8) return null;
     const cur = sgs[n-1];
     const minObs = Math.min(...sgs);
+    if (ogFixed - minObs < 0.002) return null;
+
+    const obsAtten = (ogFixed - minObs) / Math.max(ogFixed - 1.0, 1e-4);
+    if (!hasLagPlateau && isTailSettled && obsAtten < 0.45 && minObs > 1.004) {
+      const maxT = temps && temps.length ? Math.max(...temps) : 20.0;
+      const wH = [], wS = [];
+      for (let i=0; i<n; i++) {
+        if (!temps || (maxT - temps[i] <= 1.2)) { wH.push(hours[i]); wS.push(sgs[i]); }
+      }
+      if (wS.length >= 8) {
+        const fgBase = median(wS.slice(-Math.min(36, Math.max(6, wS.length >> 1))));
+        const y0 = median(wS.slice(0, Math.min(5, wS.length)));
+        let best = null;
+        for (let dfg = -12; dfg <= 12; dfg++) {
+          const fgTry = fgBase + dfg * 0.00005;
+          const ogTry = 1.0 + (fgTry - 1.0) / 0.25;
+          const ATry = Math.max(ogTry - fgTry, 0.005);
+          const c0 = Math.max(y0 - fgTry, 0.0004);
+          if (c0 >= ATry * 0.95) continue;
+          const u0 = Math.log(-Math.log(1.0 - c0 / ATry));
+          for (let ik = 1; ik <= 80; ik++) {
+            const k = 0.02 + ik * 0.003;
+            const muTry = k * ATry / Math.E;
+            const lamTry = (u0 - 1.0) / k;
+            let rss = 0;
+            for (let i=0; i<wH.length; i++) {
+              const r = gompertzEval(ogTry, fgTry, muTry, lamTry, wH[i]) - wS[i];
+              rss += r * r;
+            }
+            if (!best || rss < best.rss) best = { rss, og: ogTry, fg: fgTry, mu: muTry, lam: lamTry };
+          }
+        }
+        if (best) {
+          const rmse = Math.sqrt(best.rss / wH.length);
+          const fgSigma = Math.max(0.0006, rmse * 1.5);
+          const ogSigma = 1.6 * (best.fg - 1.0);
+          return { og: best.og, fg: best.fg, mu: best.mu, lam: best.lam, fgSigma, ogSigma, ogInferred: true, obsStartSg: ogFixed, etaH: null };
+        }
+      }
+    }
     if (ogFixed - minObs < 0.003) return null;
     const priorFg = Math.max(0.998, 1.0 + 0.25*(ogFixed - 1.0));
     const tailMed = median(sgs.slice(-Math.min(12, n)));
@@ -250,10 +293,9 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     let ogRaw = Math.max(...sgs);
     const lagP = plateaus.find(p => p.kind === "Lag");
     const krausen = lagP && (lagP.sg < ogRaw - 0.0015);
-    const og = krausen ? lagP.sg : ogRaw;
-    const fitSgs = krausen ? sgs.map(v => Math.min(v, og)) : sgs;
+    const ogObs = krausen ? lagP.sg : ogRaw;
+    const fitSgs = krausen ? sgs.map(v => Math.min(v, ogObs)) : sgs;
     const cur = sgs[sgs.length-1];
-    const priorFg = Math.max(0.998, 1.0 + 0.25*(og - 1.0));
 
     // Tail 6h slope
     const tailCut = hours[hours.length-1] - 6.0;
@@ -262,30 +304,46 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const tf = fitLinear(tH, tS);
     const rate = tf ? tf.slope : 0;
 
-    // Cold crash check (>= 4C drop)
+    // Cold crash & plateau settlement checks
     const maxT = Math.max(...temps), curT = temps[temps.length-1];
-    const isColdCrash = (maxT - curT >= 4.0) && (og - cur > 0.005);
+    const warmMedT = median(temps.slice(0, Math.max(6, Math.floor(temps.length * 0.7))));
+    const smoothSgs = fitSgs.map((v, i) => {
+      const a = fitSgs[Math.max(0, i-1)], c = fitSgs[Math.min(fitSgs.length-1, i+1)];
+      return a + v + c - Math.min(a, v, c) - Math.max(a, v, c);
+    });
+    const minSg = Math.min(...smoothSgs);
+    const obsDrop = ogObs - minSg;
+    const rateNearZero = (rate >= -0.00012 && rate <= 0.00040);
+    const hasTailPlateau = plateaus.some(p => p.kind === "Tail" || (p.kind === "Mid" && (hours[hours.length-1] - p.endH) <= 6.0 && p.durationH >= 8.0));
+    const isTailSettled = (rateNearZero && obsDrop >= 0.002) || hasTailPlateau;
 
-    const gomp = fitGompertz(hours, fitSgs, og);
+    const gomp = fitGompertz(hours, fitSgs, ogObs, temps, Boolean(lagP), isTailSettled);
+    const og = (gomp && gomp.ogInferred) ? gomp.og : ogObs;
+    const priorFg = Math.max(0.998, 1.0 + 0.25*(og - 1.0));
     const predFg = gomp ? gomp.fg : priorFg;
     const drop = og - cur;
-    const rateNearZero = Math.abs(rate) < 0.00012;
+    const maxDrop = og - minSg;
+    const isSettled = (rateNearZero && maxDrop >= 0.003 && (cur <= predFg + 0.002 || minSg <= predFg + 0.001)) || hasTailPlateau;
+    const isColdCrash = maxDrop >= 0.003 && ((maxT - curT >= 3.5) || (isSettled && (warmMedT - curT >= 1.5) && curT < 16.5));
+    const ogNote = (gomp && gomp.ogInferred)
+      ? ` Bayesian inferred OG: ${gomp.og.toFixed(4)} (±${gomp.ogSigma.toFixed(3)}, started ~${Math.abs(gomp.lam).toFixed(0)}h before capture at ${gomp.obsStartSg.toFixed(4)}).`
+      : "";
 
     let phase = "Active", desc = "";
     if (isColdCrash) {
       phase = "Cold Crash";
-      desc = `Temperature dropped from ${maxT.toFixed(1)}° to ${curT.toFixed(1)}°. Apparent SG includes thermal density shift.`;
-    } else if (drop < 0.003 && rate > -0.00008) {
+      desc = `Temperature dropped from ${maxT.toFixed(1)}° to ${curT.toFixed(1)}°. Apparent SG (${cur.toFixed(4)} vs plateau ${predFg.toFixed(4)}) includes thermal density shift.${ogNote}`;
+    } else if (maxDrop < 0.003 && rate > -0.00008) {
       phase = "Lag";
       desc = `Yeast adapting in wort (${spanH.toFixed(1)} h). Hold fermentation temperature steady.`;
-    } else if (rateNearZero && drop > 0.005 && cur <= priorFg + 0.003) {
-      // SettlingDetector check: >= 8h warm tail step-down of 1.5..6 mSG
+    } else if (isSettled || (rateNearZero && drop > 0.005 && cur <= priorFg + 0.003)) {
+      // SettlingDetector / Gompertz tail plateau reached
       phase = "Conditioning";
-      desc = `Gravity settled near FG (${cur.toFixed(4)}). Allow diacetyl rest and yeast cleanup before cold crashing.`;
+      desc = `Gravity settled near FG (${predFg.toFixed(4)}).${ogNote} Allow diacetyl rest and yeast cleanup before cold crashing.`;
     } else if (rateNearZero && drop > 0.005 && cur > priorFg + 0.005) {
       phase = "Stuck";
       desc = `Stalled at ${cur.toFixed(4)} above expected FG (${priorFg.toFixed(4)}). Consider warming or gently rousing yeast.`;
-    } else if (rate < -0.0005 || (drop / Math.max(og - predFg, 0.001)) < 0.5 || (cur - predFg) > 0.012) {
+    } else if (rate < -0.0005 || (maxDrop / Math.max(og - predFg, 0.001)) < 0.5 || (cur - predFg) > 0.012) {
       phase = "Active";
       const midPause = plateaus.find(p => p.kind === "Mid" && Math.abs(cur - p.sg) <= 0.002);
       if (midPause) {
@@ -302,10 +360,12 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     let spund = null;
     if (phase !== "Stuck" && og > 1.000 && predFg < og) {
       const t15 = og - 0.90*(og - predFg);
-      const t10 = Math.max(og - Math.max(0.15*(og - predFg), 0.005), t15);
-      if (phase === "Conditioning" || phase === "Clarifying" || phase === "Cold Crash" || cur <= t15) {
+      const minDrop10 = Math.min(0.005, 0.50*(og - predFg));
+      const t10 = Math.max(og - Math.max(0.15*(og - predFg), minDrop10), t15);
+      const refSg = Math.min(cur, minSg);
+      if (phase === "Conditioning" || phase === "Clarifying" || phase === "Cold Crash" || refSg <= t15) {
         spund = { stage: "~15 psi (1.03 bar)", note: `At/near terminal gravity (<= ${t15.toFixed(3)}). Bung up to ~15 psi for natural carbonation.` };
-      } else if (cur <= t10) {
+      } else if (refSg <= t10) {
         spund = { stage: "~10 psi (0.69 bar)", note: `Active descent underway. Safe for ~10 psi; raise to ~15 psi at SG ${t15.toFixed(3)}.` };
       } else {
         spund = { stage: "Hold (0 psi)", note: `Leave blow-off open until SG reaches ${t10.toFixed(3)} so pressure does not suppress yeast growth.` };
@@ -337,7 +397,11 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
     const maxH = Math.max(lastObsH, gomp && gomp.etaH ? lastObsH + Math.min(gomp.etaH, 72) : lastObsH, 1);
 
     let minSg = Math.min(...pts.map(p=>p.sg)), maxSg = Math.max(...pts.map(p=>p.sg));
-    if (gomp) { minSg = Math.min(minSg, gomp.fg - gomp.fgSigma); maxSg = Math.max(maxSg, gomp.og); }
+    if (gomp) {
+      const gompTop = gomp.ogInferred ? gompertzEval(gomp.og, gomp.fg, gomp.mu, gomp.lam, 0) : gomp.og;
+      minSg = Math.min(minSg, gomp.fg - gomp.fgSigma);
+      maxSg = Math.max(maxSg, gompTop);
+    }
     const sgPad = Math.max((maxSg - minSg)*0.08, 0.002);
     minSg -= sgPad; maxSg += sgPad;
 
@@ -547,11 +611,14 @@ static const char APP_JS[] PROGMEM = R"rawliteral(
         for (const sl of st.slots) {
           if (sl.slot === 0 && !sl.active) continue;
           const al = (sl.alarmSg || sl.alarmTemp) ? `<span class="badge b-err">ALARM</span>` : `<span class="badge b-ok">${sl.phase}</span>`;
+          const ogTxt = (sl.inferredOg && sl.inferredOg > sl.og + 0.005)
+            ? `~${sl.inferredOg.toFixed(4)} (Bayes, obs ${sl.og.toFixed(4)})`
+            : (sl.og > 0 ? sl.og.toFixed(4) : "Auto (5th sample)");
           html += `<div class="card">
             <h3><span>Slot ${sl.slot}: ${sl.name || "Waiting..."}</span>${al}</h3>
             <div class="hero"><span>${sl.unit===2 ? sl.plato.toFixed(2)+" °P" : sl.sg.toFixed(4)+" SG"}</span><span style="font-size:1.1rem;color:var(--acc)">${sl.temp.toFixed(1)} °${sl.tempUnit}</span></div>
             <div class="kv">
-              <span>Original Gravity (OG)</span><span>${sl.og > 0 ? sl.og.toFixed(4) : "Auto (5th sample)"}</span>
+              <span>Original Gravity (OG)</span><span>${ogTxt}</span>
               <span>ABV / Attenuation</span><span>${sl.abv.toFixed(2)}% / ${sl.attenuation.toFixed(1)}%</span>
               <span>Battery / Angle</span><span>${sl.batt.toFixed(2)} V (${sl.batPct.toFixed(0)}%) / ${sl.angle.toFixed(2)}°</span>
               <span>Spunding Gate</span><span>${sl.spundStage}</span>
@@ -789,6 +856,7 @@ static void handleApiStatus()
     o["interval"] = st.interval;
     o["ageSec"] = slotAgeSeconds(s);
     o["og"] = cfg.og[cfgIdx];
+    o["inferredOg"] = st.robustOgVal;
     o["ogLocked"] = st.ogLocked;
     o["abv"] = st.abv;
     o["attenuation"] = st.attenuation;

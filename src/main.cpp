@@ -61,6 +61,18 @@ static void pushGraphPoint(int slot, uint32_t ts, float sg, float temp)
 static void loadHistoricalSlots()
 {
   DynamicJsonDocument doc(1024);
+  DynamicJsonDocument exclDoc(1024);
+  if (SPIFFS.exists(EXCLUSIONS_PATH))
+  {
+    File ef = SPIFFS.open(EXCLUSIONS_PATH, "r");
+    if (ef)
+    {
+      deserializeJson(exclDoc, ef);
+      ef.close();
+    }
+  }
+  JsonArray exclArr = exclDoc.is<JsonArray>() ? exclDoc.as<JsonArray>() : JsonArray();
+
   uint32_t maxSeq = 0;
   for (int s = 0; s < 3; s++)
   {
@@ -83,6 +95,17 @@ static void loadHistoricalSlots()
         else
           maxSeq++;
         uint32_t ts = doc["ts"] | 0U;
+        bool excluded = false;
+        for (JsonObject eo : exclArr)
+        {
+          if ((eo["slot"] | -1) == s && ts >= (eo["startTs"] | 0U) && ts <= (eo["endTs"] | 0U))
+          {
+            excluded = true;
+            break;
+          }
+        }
+        if (excluded)
+          continue;
         JsonObject payload = doc["payload"];
         if (!payload.isNull())
         {

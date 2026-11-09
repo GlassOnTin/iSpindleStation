@@ -358,9 +358,14 @@ static void updateSlotAnalytics(int s)
     return;
   }
 
-  // Robust OG from early window / max inlier
+  // Robust OG from early window / max inlier & settled min SG
   float maxSg = 0.0f;
+  float minSg = 9.999f;
   float maxTemp = -100.0f;
+  float warmTempSum = 0.0f;
+  uint16_t warmN = (n * 7) / 10;
+  if (warmN < 1)
+    warmN = 1;
   for (uint16_t i = 0; i < n; i++)
   {
     GraphPoint &gp = graphRing[s][(start + i) % GRAPH_POINTS];
@@ -368,9 +373,24 @@ static void updateSlotAnalytics(int s)
     float t = unpackGraphTemp(gp);
     if (g > maxSg)
       maxSg = g;
+    if (i > 0 && i + 1 < n)
+    {
+      float gPrev = ensureSg(unpackGraphSg(graphRing[s][(start + i - 1) % GRAPH_POINTS]) + cfg.sgOffset[s]);
+      float gNext = ensureSg(unpackGraphSg(graphRing[s][(start + i + 1) % GRAPH_POINTS]) + cfg.sgOffset[s]);
+      float gMed = gPrev + g + gNext - fminf(gPrev, fminf(g, gNext)) - fmaxf(gPrev, fmaxf(g, gNext));
+      if (gMed > 0.990f && gMed < minSg)
+        minSg = gMed;
+    }
+    else if (g > 0.990f && g < minSg)
+    {
+      minSg = g;
+    }
     if (t > maxTemp)
       maxTemp = t;
+    if (i < warmN)
+      warmTempSum += t;
   }
+  float warmMeanTemp = warmTempSum / (float)warmN;
   float refOg = (st.ogLocked && ogNorm > 1.000f) ? ogNorm : maxSg;
   st.robustOgVal = refOg;
 
@@ -401,32 +421,56 @@ static void updateSlotAnalytics(int s)
   }
   st.ratePerHour = slope;
 
-  // 75% attenuation prior FG
+  float refSg = fminf(sgNorm, minSg);
+  float obsDrop = refOg - refSg;
+  bool rateNearZero = (slope >= -0.00012f && slope <= 0.00040f);
+
+  // Bayesian reverse-OG inference when capture started mid-fermentation:
+  // If settled on a terminal plateau (minSg > 1.004) with observed attenuation < 45%
+  // (missed pre-capture descent), infer MAP starting gravity from the 75% attenuation
+  // prior: OG = 1 + 4*(FG - 1).
+  float obsAtten = (refOg - refSg) / fmaxf(refOg - 1.000f, 1e-4f);
+  if (rateNearZero && obsDrop >= 0.002f && refSg > 1.004f && obsAtten < 0.45f && refOg < 1.035f)
+  {
+    refOg = 1.000f + 4.0f * (refSg - 1.000f);
+    st.robustOgVal = refOg;
+    st.abv = (refOg - refSg) * 131.25f;
+    st.attenuation = 75.0f;
+  }
+
+  float drop = refOg - sgNorm;
+  float maxDrop = refOg - refSg;
+
+  // 75% attenuation prior FG, or observed terminal plateau if settled
   float priorFg = 1.000f + 0.25f * (refOg - 1.000f);
   if (priorFg < 0.998f)
     priorFg = 0.998f;
-  st.predictedFg = priorFg;
+  float predFg = (rateNearZero && maxDrop >= 0.003f) ? refSg : priorFg;
+  st.predictedFg = predFg;
 
-  float drop = refOg - sgNorm;
-  bool rateNearZero = fabsf(slope) < 0.00012f;
-
-  // Cold crash check (>= 4 C drop from warm peak)
+  // Cold crash check (>= 3.5 C drop from peak or >= 1.5 C drop from warm mean once settled)
   float curTempC = (st.tempUnit == 'F' || st.tempUnit == 'f')
                        ? ((st.corrTemp - 32.0f) * 5.0f / 9.0f)
                        : st.corrTemp;
   float maxTempC = (st.tempUnit == 'F' || st.tempUnit == 'f')
                        ? ((maxTemp - 32.0f) * 5.0f / 9.0f)
                        : maxTemp;
+  float warmMeanC = (st.tempUnit == 'F' || st.tempUnit == 'f')
+                        ? ((warmMeanTemp - 32.0f) * 5.0f / 9.0f)
+                        : warmMeanTemp;
+  bool isColdCrash = maxTemp > 0.0f && maxDrop >= 0.003f &&
+                     ((maxTempC - curTempC) >= 3.5f ||
+                      (rateNearZero && (warmMeanC - curTempC) >= 1.5f && curTempC < 16.5f));
 
-  if (maxTemp > 0.0f && (maxTempC - curTempC) >= 4.0f && drop > 0.005f)
+  if (isColdCrash)
   {
     st.phase = PHASE_COLD_CRASH;
   }
-  else if (drop < 0.003f && slope > -0.00008f)
+  else if (maxDrop < 0.003f && slope > -0.00008f)
   {
     st.phase = PHASE_LAG;
   }
-  else if (rateNearZero && drop > 0.005f && sgNorm <= priorFg + 0.003f)
+  else if (rateNearZero && maxDrop >= 0.003f && sgNorm <= predFg + 0.003f)
   {
     st.phase = PHASE_CONDITIONING;
   }
@@ -434,8 +478,8 @@ static void updateSlotAnalytics(int s)
   {
     st.phase = PHASE_STUCK;
   }
-  else if (slope < -0.0005f || (drop / fmaxf(refOg - priorFg, 0.001f)) < 0.50f ||
-           (sgNorm - priorFg) > 0.012f)
+  else if (slope < -0.0005f || (maxDrop / fmaxf(refOg - predFg, 0.001f)) < 0.50f ||
+           (sgNorm - predFg) > 0.012f)
   {
     st.phase = PHASE_ACTIVE;
   }
@@ -445,7 +489,7 @@ static void updateSlotAnalytics(int s)
   }
 
   // Spunding evaluation (ported from Spunding.kt)
-  if (st.phase == PHASE_INSUFFICIENT || st.phase == PHASE_STUCK || refOg <= 1.000f || priorFg >= refOg)
+  if (st.phase == PHASE_INSUFFICIENT || st.phase == PHASE_STUCK || refOg <= 1.000f || predFg >= refOg)
   {
     st.spundStage = SPUND_NONE;
     st.spundTargetSg = 0.0f;
@@ -453,19 +497,20 @@ static void updateSlotAnalytics(int s)
   else if (st.phase == PHASE_CONDITIONING || st.phase == PHASE_CLARIFYING || st.phase == PHASE_COLD_CRASH)
   {
     st.spundStage = SPUND_15PSI;
-    st.spundTargetSg = priorFg;
+    st.spundTargetSg = predFg;
   }
   else
   {
-    float target15 = refOg - 0.90f * (refOg - priorFg);
-    float drop10 = fmaxf(0.15f * (refOg - priorFg), 0.005f);
+    float target15 = refOg - 0.90f * (refOg - predFg);
+    float minDrop10 = fminf(0.005f, 0.50f * (refOg - predFg));
+    float drop10 = fmaxf(0.15f * (refOg - predFg), minDrop10);
     float target10 = fmaxf(refOg - drop10, target15);
-    if (sgNorm <= target15)
+    if (refSg <= target15)
     {
       st.spundStage = SPUND_15PSI;
       st.spundTargetSg = target15;
     }
-    else if (sgNorm <= target10)
+    else if (refSg <= target10)
     {
       st.spundStage = SPUND_10PSI;
       st.spundTargetSg = target15;
